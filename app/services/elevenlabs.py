@@ -75,6 +75,42 @@ async def _get_signed_url(agent_id: str) -> str:
         return resp.json()["signed_url"]
 
 
+async def transcribe_audio(audio_url: str) -> Optional[str]:
+    """
+    Download audio from Green API and transcribe via ElevenLabs Scribe STT.
+    Returns transcribed text or None on failure.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # 1. Download audio file
+            audio_resp = await client.get(audio_url)
+            audio_resp.raise_for_status()
+            audio_bytes = audio_resp.content
+            content_type = audio_resp.headers.get("content-type", "audio/ogg")
+
+        # 2. Send to ElevenLabs Scribe STT
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{ELEVENLABS_BASE}/speech-to-text",
+                headers=_el_headers(),
+                files={"file": ("audio.ogg", audio_bytes, content_type)},
+                data={"model_id": "scribe_v1"},
+            )
+            resp.raise_for_status()
+            text = resp.json().get("text", "").strip()
+
+        if text:
+            logger.info(f"Transcribed audio ({len(audio_bytes)} bytes): {text[:100]}")
+            return text
+        else:
+            logger.warning("ElevenLabs STT returned empty text")
+            return None
+
+    except Exception as e:
+        logger.error(f"Audio transcription failed: {e}")
+        return None
+
+
 async def generate_text_reply(
     agent_id: str,
     system_prompt: str,

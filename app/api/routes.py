@@ -59,6 +59,11 @@ class CampaignCreateRequest(BaseModel):
     agent_id: str
 
 
+class BulkSendRequest(BaseModel):
+    campaign_external_id: str
+    leads: list[SendRequest]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -123,6 +128,86 @@ async def send_message_endpoint(
         "status": "sent",
         "message_id": str(msg.id),
         "conversation_id": str(conversation.id),
+    }
+
+
+@router.post("/api/send/bulk", dependencies=[Depends(require_api_key)])
+async def bulk_send_endpoint(
+    req: BulkSendRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Send initial messages to up to 500 leads at once.
+    Processes sequentially to respect instance rate limits and delays.
+    Returns per-lead results.
+    """
+    results = []
+    for lead in req.leads:
+        # Override campaign_external_id from parent request if not set per-lead
+        if not lead.campaign_external_id:
+            lead.campaign_external_id = req.campaign_external_id
+
+        # Blacklist check
+        if await is_blacklisted(db, lead.phone):
+            results.append({"phone": lead.phone, "status": "blacklisted"})
+            continue
+
+        # Find campaign
+        result = await db.execute(
+            select(Campaign).where(Campaign.external_id == lead.campaign_external_id)
+        )
+        campaign = result.scalar_one_or_none()
+        if not campaign:
+            results.append({"phone": lead.phone, "status": "error", "detail": "campaign not found"})
+            continue
+
+        # Find or create conversation
+        result = await db.execute(
+            select(Conversation).where(
+                Conversation.campaign_id == campaign.id,
+                Conversation.phone == lead.phone,
+            )
+        )
+        conversation = result.scalar_one_or_none()
+
+        if conversation is None:
+            conversation = Conversation(
+                campaign_id=campaign.id,
+                lead_id=lead.lead_id,
+                phone=lead.phone,
+                lead_name=lead.lead_name,
+                status="active",
+            )
+            db.add(conversation)
+            await db.commit()
+            await db.refresh(conversation)
+        elif conversation.status == "stopped":
+            results.append({"phone": lead.phone, "status": "skipped"})
+            continue
+
+        # Send
+        msg = await send_initial_message(
+            db=db,
+            conversation=conversation,
+            initial_text=lead.initial_message,
+            batch_index=lead.batch_index,
+        )
+
+        if msg is None:
+            results.append({"phone": lead.phone, "status": "error", "detail": "no available instances"})
+        else:
+            results.append({
+                "phone": lead.phone,
+                "status": "sent",
+                "message_id": str(msg.id),
+                "conversation_id": str(conversation.id),
+            })
+
+    sent = sum(1 for r in results if r["status"] == "sent")
+    return {
+        "total": len(results),
+        "sent": sent,
+        "results": results,
     }
 
 

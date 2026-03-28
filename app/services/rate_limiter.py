@@ -16,6 +16,13 @@ GREETINGS = [
 ]
 
 
+async def reply_pause(min_sec: float = 2.0, max_sec: float = 5.0) -> None:
+    """Short human-like typing delay before sending an AI reply."""
+    delay = random.uniform(min_sec, max_sec)
+    logger.debug(f"Reply pause: {delay:.1f}s")
+    await asyncio.sleep(delay)
+
+
 async def wait_before_send(instance: WhatsAppInstance) -> None:
     min_sec = instance.min_delay_sec
     max_sec = instance.max_delay_sec

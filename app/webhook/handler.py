@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Campaign, Conversation, WhatsAppMessage
 from app.services.blacklist import add_to_blacklist, is_blacklisted, is_stop_message
-from app.services.elevenlabs import generate_text_reply, get_agent_prompt
+from app.services.elevenlabs import generate_text_reply, get_agent_prompt, transcribe_audio
 from app.services.sender import send_message
 
 logger = logging.getLogger(__name__)
@@ -36,14 +36,45 @@ async def handle_incoming(
         return
 
     message_data = payload.get("messageData", {})
-    if message_data.get("typeMessage") != "textMessage":
-        logger.debug(f"Skipping non-text message from {phone}")
-        return
-
-    text = message_data.get("textMessageData", {}).get("textMessage", "").strip()
+    msg_type = message_data.get("typeMessage", "")
     provider_message_id: Optional[str] = payload.get("idMessage")
 
-    if not text:
+    # Map non-text message types to a placeholder text for the AI
+    NON_TEXT_PLACEHOLDERS = {
+        "imageMessage":    "[The customer sent a photo]",
+        "videoMessage":    "[The customer sent a video]",
+        "documentMessage": "[The customer sent a document/file]",
+        "stickerMessage":  "[The customer sent a sticker]",
+        "locationMessage": "[The customer sent their location]",
+        "contactMessage":  "[The customer sent a contact card]",
+    }
+
+    if msg_type == "textMessage":
+        text = message_data.get("textMessageData", {}).get("textMessage", "").strip()
+        if not text:
+            return
+
+    elif msg_type == "audioMessage":
+        # Transcribe voice message via ElevenLabs Scribe STT
+        audio_url = message_data.get("fileMessageData", {}).get("downloadUrl", "")
+        if not audio_url:
+            logger.warning(f"audioMessage from {phone} has no downloadUrl, using placeholder")
+            text = "[The customer sent a voice message]"
+        else:
+            transcribed = await transcribe_audio(audio_url)
+            if transcribed:
+                text = transcribed
+                logger.info(f"Voice message from {phone} transcribed: {text[:80]}")
+            else:
+                text = "[The customer sent a voice message that could not be transcribed]"
+                logger.warning(f"Failed to transcribe voice from {phone}")
+
+    elif msg_type in NON_TEXT_PLACEHOLDERS:
+        text = NON_TEXT_PLACEHOLDERS[msg_type]
+        logger.info(f"Non-text message ({msg_type}) from {phone} — using placeholder")
+
+    else:
+        logger.debug(f"Unsupported message type '{msg_type}' from {phone}, ignoring")
         return
 
     # 3. Deduplicate by provider_message_id
@@ -150,4 +181,5 @@ async def handle_incoming(
         text=reply,
         lead_name=conversation.lead_name,
         batch_index=0,
+        is_reply=True,
     )

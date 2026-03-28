@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Conversation, WhatsAppInstance, WhatsAppMessage
 from app.services import pool as instance_pool
-from app.services.rate_limiter import batch_pause, personalize_message, wait_before_send
+from app.services.rate_limiter import batch_pause, personalize_message, reply_pause, wait_before_send
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,7 @@ async def send_message(
     text: str,
     lead_name: Optional[str] = None,
     batch_index: int = 0,
+    is_reply: bool = False,
 ) -> Optional[WhatsAppMessage]:
     instance = await instance_pool.get_best_instance(db)
     if not instance:
@@ -29,8 +30,13 @@ async def send_message(
 
     # Personalize and apply batch pause
     personalized = personalize_message(text, lead_name)
-    await batch_pause(batch_index)
-    await wait_before_send(instance)
+    if is_reply:
+        # Short human-like typing delay for AI replies (2–5s)
+        await reply_pause()
+    else:
+        # Full anti-spam delay for bulk outreach
+        await batch_pause(batch_index)
+        await wait_before_send(instance)
 
     chat_id = _format_phone(conversation.phone)
     provider_message_id: Optional[str] = None
