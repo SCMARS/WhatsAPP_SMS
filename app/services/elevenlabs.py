@@ -75,27 +75,76 @@ async def _get_signed_url(agent_id: str) -> str:
         return resp.json()["signed_url"]
 
 
-async def transcribe_audio(audio_url: str) -> Optional[str]:
+async def _download_audio(
+    direct_url: str,
+    instance_id: Optional[str] = None,
+    api_token: Optional[str] = None,
+    message_id: Optional[str] = None,
+) -> Optional[bytes]:
     """
-    Download audio from Green API and transcribe via ElevenLabs Scribe STT.
+    Download audio bytes. Tries direct URL first, then Green API download endpoint.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # 1. Try the direct pre-signed URL from webhook
+        try:
+            r = await client.get(direct_url)
+            if r.status_code == 200 and r.content:
+                logger.debug(f"Audio downloaded via direct URL ({len(r.content)} bytes)")
+                return r.content
+            else:
+                logger.warning(f"Direct URL returned {r.status_code}, trying Green API endpoint")
+        except Exception as e:
+            logger.warning(f"Direct URL download failed: {e}, trying Green API endpoint")
+
+        # 2. Fall back to Green API downloadFile endpoint
+        if instance_id and api_token and message_id:
+            try:
+                green_url = (
+                    f"https://7107.api.greenapi.com"
+                    f"/waInstance{instance_id}"
+                    f"/downloadFile/{api_token}"
+                )
+                r = await client.post(green_url, json={"idMessage": message_id})
+                if r.status_code == 200:
+                    data = r.json()
+                    # Green API returns base64-encoded file body
+                    import base64
+                    file_b64 = data.get("body", "")
+                    if file_b64:
+                        audio_bytes = base64.b64decode(file_b64)
+                        logger.debug(f"Audio downloaded via Green API endpoint ({len(audio_bytes)} bytes)")
+                        return audio_bytes
+            except Exception as e:
+                logger.error(f"Green API downloadFile also failed: {e}")
+
+    return None
+
+
+async def transcribe_audio(
+    audio_url: str,
+    instance_id: Optional[str] = None,
+    api_token: Optional[str] = None,
+    message_id: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Download audio and transcribe via ElevenLabs Scribe STT.
     Returns transcribed text or None on failure.
     """
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # 1. Download audio file
-            audio_resp = await client.get(audio_url)
-            audio_resp.raise_for_status()
-            audio_bytes = audio_resp.content
-            content_type = audio_resp.headers.get("content-type", "audio/ogg")
+        audio_bytes = await _download_audio(audio_url, instance_id, api_token, message_id)
+        if not audio_bytes:
+            logger.error("Could not download audio from any source")
+            return None
 
-        # 2. Send to ElevenLabs Scribe STT
+        # Send to ElevenLabs Scribe STT
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{ELEVENLABS_BASE}/speech-to-text",
                 headers=_el_headers(),
-                files={"file": ("audio.ogg", audio_bytes, content_type)},
+                files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
                 data={"model_id": "scribe_v1"},
             )
+            logger.debug(f"ElevenLabs STT response: {resp.status_code} {resp.text[:200]}")
             resp.raise_for_status()
             text = resp.json().get("text", "").strip()
 

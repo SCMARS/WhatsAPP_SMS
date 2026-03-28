@@ -56,12 +56,27 @@ async def handle_incoming(
 
     elif msg_type == "audioMessage":
         # Transcribe voice message via ElevenLabs Scribe STT
-        audio_url = message_data.get("fileMessageData", {}).get("downloadUrl", "")
-        if not audio_url:
-            logger.warning(f"audioMessage from {phone} has no downloadUrl, using placeholder")
+        file_data = message_data.get("fileMessageData", {})
+        audio_url = file_data.get("downloadUrl", "")
+
+        # Look up instance credentials for fallback download
+        from app.db.models import WhatsAppInstance
+        inst_result = await db.execute(
+            select(WhatsAppInstance).where(WhatsAppInstance.instance_id == instance_id)
+        )
+        wa_instance = inst_result.scalar_one_or_none()
+        inst_api_token = wa_instance.api_token if wa_instance else None
+
+        if not audio_url and not inst_api_token:
+            logger.warning(f"audioMessage from {phone} has no downloadUrl and no instance, using placeholder")
             text = "[The customer sent a voice message]"
         else:
-            transcribed = await transcribe_audio(audio_url)
+            transcribed = await transcribe_audio(
+                audio_url=audio_url,
+                instance_id=instance_id,
+                api_token=inst_api_token,
+                message_id=provider_message_id,
+            )
             if transcribed:
                 text = transcribed
                 logger.info(f"Voice message from {phone} transcribed: {text[:80]}")
