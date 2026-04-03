@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     ELEVENLABS_API_KEY: str
     ANTHROPIC_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
     API_SECRET_KEY: str
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8000

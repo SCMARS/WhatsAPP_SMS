@@ -1,14 +1,10 @@
 """
-ElevenLabs ConvAI integration — text-only mode via WebSocket.
+ElevenLabs integration — ConvAI WebSocket (text-only) + STT (Scribe).
 
-The agent must have "Text mode" enabled in ElevenLabs dashboard (Advanced tab).
-System prompt is configured on the agent in ElevenLabs — no local override needed.
-
-Protocol:
-1. Connect → receive conversation_initiation_metadata
-2. Send conversation_initiation_client_data with text_only=true
-3. Immediately send user_message
-4. Collect agent_chat_response_part deltas → agent_response (final text)
+Conversation continuity:
+  - On first message: connect without conversation_id, save returned id to DB.
+  - On subsequent messages: append conversation_id as query param → ElevenLabs
+    resumes the SAME conversation (one chat per WhatsApp contact).
 """
 import asyncio
 import json
@@ -28,8 +24,8 @@ logger = logging.getLogger(__name__)
 ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
 
 WHATSAPP_CONTEXT = (
-    "\n\n[CONTEXT: This is a WhatsApp text conversation. "
-    "Keep replies short — max 3-4 sentences. Text only, no markdown.]"
+    "This is a WhatsApp text chat. Keep your reply short — max 3-4 sentences. "
+    "Plain text only, no markdown."
 )
 
 
@@ -81,11 +77,8 @@ async def _download_audio(
     api_token: Optional[str] = None,
     message_id: Optional[str] = None,
 ) -> Optional[bytes]:
-    """
-    Download audio bytes. Tries direct URL first, then Green API download endpoint.
-    """
+    """Download audio bytes. Tries direct URL first, then Green API download endpoint."""
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. Try the direct pre-signed URL from webhook
         try:
             r = await client.get(direct_url)
             if r.status_code == 200 and r.content:
@@ -96,7 +89,6 @@ async def _download_audio(
         except Exception as e:
             logger.warning(f"Direct URL download failed: {e}, trying Green API endpoint")
 
-        # 2. Fall back to Green API downloadFile endpoint
         if instance_id and api_token and message_id:
             try:
                 green_url = (
@@ -106,13 +98,11 @@ async def _download_audio(
                 )
                 r = await client.post(green_url, json={"idMessage": message_id})
                 if r.status_code == 200:
-                    data = r.json()
-                    # Green API returns base64-encoded file body
                     import base64
-                    file_b64 = data.get("body", "")
+                    file_b64 = r.json().get("body", "")
                     if file_b64:
                         audio_bytes = base64.b64decode(file_b64)
-                        logger.debug(f"Audio downloaded via Green API endpoint ({len(audio_bytes)} bytes)")
+                        logger.debug(f"Audio downloaded via Green API ({len(audio_bytes)} bytes)")
                         return audio_bytes
             except Exception as e:
                 logger.error(f"Green API downloadFile also failed: {e}")
@@ -126,17 +116,13 @@ async def transcribe_audio(
     api_token: Optional[str] = None,
     message_id: Optional[str] = None,
 ) -> Optional[str]:
-    """
-    Download audio and transcribe via ElevenLabs Scribe STT.
-    Returns transcribed text or None on failure.
-    """
+    """Download audio and transcribe via ElevenLabs Scribe STT."""
     try:
         audio_bytes = await _download_audio(audio_url, instance_id, api_token, message_id)
         if not audio_bytes:
             logger.error("Could not download audio from any source")
             return None
 
-        # Send to ElevenLabs Scribe STT
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{ELEVENLABS_BASE}/speech-to-text",
@@ -168,7 +154,7 @@ async def generate_text_reply(
 ) -> str:
     """
     Generate a text reply via ElevenLabs ConvAI WebSocket (text-only mode).
-    Sends conversation history as contextual_update before the user message.
+    Sends full conversation history as contextual_update before the user message.
     """
     user_messages = [m for m in history if m.get("role") == "user"]
     if not user_messages:
@@ -176,18 +162,13 @@ async def generate_text_reply(
         return ""
 
     last_user_text = user_messages[-1]["content"]
+    prior_turns = history[:-1]
 
-    # Add lead name and WhatsApp context hint as contextual update
     context_parts = []
     if lead_name:
         context_parts.append(f"Customer name: {lead_name}.")
-    context_parts.append(
-        "This is a WhatsApp text chat. Keep your reply short — max 3-4 sentences. Plain text only."
-    )
+    context_parts.append(WHATSAPP_CONTEXT)
     context_text = " ".join(context_parts)
-
-    # Prior conversation turns (excluding last user message)
-    prior_turns = history[:-1]
 
     signed_url = await _get_signed_url(agent_id)
     reply = ""
@@ -214,7 +195,7 @@ async def generate_text_reply(
                 },
             }))
 
-            # 3. Inject prior conversation history as contextual_update (no agent response)
+            # 3. Inject prior conversation history
             if prior_turns:
                 history_text = "\n".join(
                     f"{'User' if m['role'] == 'user' else 'Agent'}: {m['content']}"
@@ -231,7 +212,7 @@ async def generate_text_reply(
                 "text": context_text,
             }))
 
-            # 5. Send the actual user message
+            # 5. Send user message
             await ws.send(json.dumps({
                 "type": "user_message",
                 "text": last_user_text,
@@ -256,7 +237,7 @@ async def generate_text_reply(
                         return
 
                     elif t in ("agent_chat_response_part", "internal_tentative_agent_response"):
-                        pass  # streaming parts — wait for final agent_response
+                        pass
 
             await asyncio.wait_for(_collect(), timeout=45)
 

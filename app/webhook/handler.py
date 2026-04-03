@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Campaign, Conversation, WhatsAppMessage
 from app.services.blacklist import add_to_blacklist, is_blacklisted, is_stop_message
 from app.services.elevenlabs import generate_text_reply, get_agent_prompt, transcribe_audio
+from app.services.gemini import describe_image
 from app.services.sender import send_message
 
 logger = logging.getLogger(__name__)
@@ -39,9 +40,7 @@ async def handle_incoming(
     msg_type = message_data.get("typeMessage", "")
     provider_message_id: Optional[str] = payload.get("idMessage")
 
-    # Map non-text message types to a placeholder text for the AI
     NON_TEXT_PLACEHOLDERS = {
-        "imageMessage":    "[The customer sent a photo]",
         "videoMessage":    "[The customer sent a video]",
         "documentMessage": "[The customer sent a document/file]",
         "stickerMessage":  "[The customer sent a sticker]",
@@ -49,23 +48,22 @@ async def handle_incoming(
         "contactMessage":  "[The customer sent a contact card]",
     }
 
+    # Look up instance credentials once (needed for audio/image download fallback)
+    from app.db.models import WhatsAppInstance
+    inst_result = await db.execute(
+        select(WhatsAppInstance).where(WhatsAppInstance.instance_id == instance_id)
+    )
+    wa_instance = inst_result.scalar_one_or_none()
+    inst_api_token = wa_instance.api_token if wa_instance else None
+
     if msg_type == "textMessage":
         text = message_data.get("textMessageData", {}).get("textMessage", "").strip()
         if not text:
             return
 
     elif msg_type == "audioMessage":
-        # Transcribe voice message via ElevenLabs Scribe STT
         file_data = message_data.get("fileMessageData", {})
         audio_url = file_data.get("downloadUrl", "")
-
-        # Look up instance credentials for fallback download
-        from app.db.models import WhatsAppInstance
-        inst_result = await db.execute(
-            select(WhatsAppInstance).where(WhatsAppInstance.instance_id == instance_id)
-        )
-        wa_instance = inst_result.scalar_one_or_none()
-        inst_api_token = wa_instance.api_token if wa_instance else None
 
         if not audio_url and not inst_api_token:
             logger.warning(f"audioMessage from {phone} has no downloadUrl and no instance, using placeholder")
@@ -83,6 +81,20 @@ async def handle_incoming(
             else:
                 text = "[The customer sent a voice message that could not be transcribed]"
                 logger.warning(f"Failed to transcribe voice from {phone}")
+
+    elif msg_type == "imageMessage":
+        file_data = message_data.get("fileMessageData", {})
+        image_url = file_data.get("downloadUrl", "")
+        caption = file_data.get("caption", "") or ""
+
+        text = await describe_image(
+            image_url=image_url,
+            instance_id=instance_id,
+            api_token=inst_api_token,
+            message_id=provider_message_id,
+            caption=caption if caption else None,
+        )
+        logger.info(f"Image from {phone} described: {text[:100]}")
 
     elif msg_type in NON_TEXT_PLACEHOLDERS:
         text = NON_TEXT_PLACEHOLDERS[msg_type]
