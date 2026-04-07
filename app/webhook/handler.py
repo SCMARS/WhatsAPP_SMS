@@ -4,6 +4,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.models import Campaign, Conversation, WhatsAppMessage
 from app.services.blacklist import add_to_blacklist, is_blacklisted, is_stop_message
 from app.services.elevenlabs import generate_text_reply, get_agent_prompt, transcribe_audio
@@ -19,15 +20,19 @@ async def handle_incoming(
     instance_id: str,
 ) -> None:
     # 1. Filter: only incomingMessageReceived
-    if payload.get("typeWebhook") != "incomingMessageReceived":
+    type_webhook = payload.get("typeWebhook")
+    if type_webhook != "incomingMessageReceived":
+        logger.debug(f"Ignoring webhook type={type_webhook}")
         return
 
     # Extract sender data
     sender_data = payload.get("senderData", {})
     chat_id = sender_data.get("chatId", "")
+    provider_message_id: Optional[str] = payload.get("idMessage")
 
     # Skip group messages
     if "@g.us" in chat_id:
+        logger.info(f"Incoming group message ignored chatId={chat_id}")
         return
 
     # 2. Extract phone, text, provider_message_id
@@ -36,9 +41,24 @@ async def handle_incoming(
         logger.warning("Could not extract phone from chatId")
         return
 
+    # Normalize phone so it matches records created via /api/send (which may include '+')
+    digits = "".join(c for c in phone if c.isdigit())
+    phone_variants = {phone}
+    if digits:
+        phone_variants.add(digits)
+        phone_variants.add(f"+{digits}")
+
     message_data = payload.get("messageData", {})
     msg_type = message_data.get("typeMessage", "")
-    provider_message_id: Optional[str] = payload.get("idMessage")
+    logger.info(
+        "Incoming webhook: instance_id=%s chatId=%s phone=%s digits=%s type=%s idMessage=%s",
+        instance_id,
+        chat_id,
+        phone,
+        digits,
+        msg_type,
+        provider_message_id,
+    )
 
     NON_TEXT_PLACEHOLDERS = {
         "videoMessage":    "[The customer sent a video]",
@@ -60,6 +80,7 @@ async def handle_incoming(
         text = message_data.get("textMessageData", {}).get("textMessage", "").strip()
         if not text:
             return
+        logger.info(f"Inbound text from {phone}: {text[:200]}")
 
     elif msg_type == "audioMessage":
         file_data = message_data.get("fileMessageData", {})
@@ -87,6 +108,22 @@ async def handle_incoming(
         image_url = file_data.get("downloadUrl", "")
         caption = file_data.get("caption", "") or ""
 
+        # If we can't analyze images (no Gemini key), reply immediately asking for text description.
+        # This prevents the agent from "getting stuck" repeating the same photo disclaimer.
+        if not settings.GEMINI_API_KEY:
+            quick_reply = "Фото вижу как вложение, но не могу его анализировать. Опишите, пожалуйста, что на фото и что именно нужно."
+            # We don't need LLM here; just respond and exit.
+            result = await db.execute(
+                select(Conversation)
+                .where(Conversation.phone.in_(list(phone_variants)), Conversation.status == "active")
+                .order_by(Conversation.created_at.desc())
+                .limit(1)
+            )
+            conv = result.scalar_one_or_none()
+            if conv:
+                await send_message(db=db, conversation=conv, text=quick_reply, lead_name=conv.lead_name, batch_index=0, is_reply=True)
+            return
+
         text = await describe_image(
             image_url=image_url,
             instance_id=instance_id,
@@ -112,12 +149,12 @@ async def handle_incoming(
             )
         )
         if result.scalar_one_or_none():
-            logger.debug(f"Duplicate message {provider_message_id}, skipping")
+            logger.info(f"Duplicate inbound message {provider_message_id}, skipping")
             return
 
     # 4. Blacklist check
     if await is_blacklisted(db, phone):
-        logger.debug(f"Message from blacklisted phone {phone}, ignoring")
+        logger.info(f"Message from blacklisted phone {phone}, ignoring")
         return
 
     # 5. STOP check
@@ -129,15 +166,34 @@ async def handle_incoming(
     # 6. Find most recent active Conversation by phone
     result = await db.execute(
         select(Conversation)
-        .where(Conversation.phone == phone, Conversation.status == "active")
+        .where(Conversation.phone.in_(list(phone_variants)), Conversation.status == "active")
         .order_by(Conversation.created_at.desc())
         .limit(1)
     )
     conversation = result.scalar_one_or_none()
 
     if not conversation:
-        logger.warning(f"No active conversation found for phone {phone}")
-        return
+        # If user writes first (no prior /api/send), auto-create a conversation in default campaign.
+        camp_res = await db.execute(
+            select(Campaign).where(Campaign.external_id == "default")
+        )
+        campaign = camp_res.scalar_one_or_none()
+        if not campaign:
+            logger.warning(f"No active conversation found for phone {phone} and default campaign missing")
+            return
+
+        normalized_phone = f"+{digits}" if digits else phone
+        conversation = Conversation(
+            campaign_id=campaign.id,
+            lead_id=normalized_phone or phone,
+            phone=normalized_phone or phone,
+            lead_name=None,
+            status="active",
+        )
+        db.add(conversation)
+        await db.commit()
+        await db.refresh(conversation)
+        logger.info(f"Auto-created conversation for inbound phone {conversation.phone}")
 
     # 7. Save inbound message
     inbound_msg = WhatsAppMessage(
@@ -192,14 +248,22 @@ async def handle_incoming(
             system_prompt=campaign.agent_prompt,
             history=llm_history,
             lead_name=conversation.lead_name,
+            # Keep one ElevenLabs conversation per WhatsApp chat/phone
+            chat_key=conversation.phone,
         )
     except Exception as e:
         logger.error(f"ElevenLabs generate_text_reply failed: {e}")
-        return
+        reply = (
+            "Извините, сейчас есть задержка с ассистентом. "
+            "Я получил ваше сообщение и скоро отвечу подробнее."
+        )
 
     if not reply:
         logger.warning(f"Empty reply from ElevenLabs for conversation {conversation.id}")
-        return
+        reply = (
+            "Получил ваше сообщение. Если удобно, напишите чуть подробнее, "
+            "и я сразу помогу."
+        )
 
     # 13. Send reply
     await send_message(

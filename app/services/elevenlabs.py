@@ -28,6 +28,134 @@ WHATSAPP_CONTEXT = (
     "Plain text only, no markdown."
 )
 
+class _ChatSession:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.last_used = asyncio.get_event_loop().time()
+
+    async def _ensure_connected(self, agent_id: str) -> websockets.WebSocketClientProtocol:
+        if self.ws is not None:
+            return self.ws
+
+        signed_url = await _get_signed_url(agent_id)
+        ws = await websockets.connect(
+            signed_url,
+            ssl=_ssl_ctx(),
+            open_timeout=15,
+            close_timeout=10,
+            # Disable client-side keepalive timeout which caused false 1011 disconnects.
+            ping_interval=None,
+            ping_timeout=None,
+        )
+
+        # Wait for initiation metadata
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg.get("type") == "conversation_initiation_metadata":
+                break
+
+        # Enable text-only mode once per socket
+        await ws.send(json.dumps({
+            "type": "conversation_initiation_client_data",
+            "conversation_config_override": {
+                "conversation": {"text_only": True},
+            },
+        }))
+
+        self.ws = ws
+        return ws
+
+    async def ask(
+        self,
+        agent_id: str,
+        context_text: str,
+        prior_turns: list[dict],
+        last_user_text: str,
+    ) -> str:
+        async with self.lock:
+            self.last_used = asyncio.get_event_loop().time()
+            reply = ""
+
+            async def _send_turn(ws: websockets.WebSocketClientProtocol) -> None:
+                # Inject history + context each turn (cheap, keeps agent grounded)
+                if prior_turns:
+                    history_text = "\n".join(
+                        f"{'User' if m['role'] == 'user' else 'Agent'}: {m['content']}"
+                        for m in prior_turns
+                    )
+                    await ws.send(json.dumps({
+                        "type": "contextual_update",
+                        "text": f"Previous conversation:\n{history_text}",
+                    }))
+
+                await ws.send(json.dumps({
+                    "type": "contextual_update",
+                    "text": context_text,
+                }))
+
+                await ws.send(json.dumps({
+                    "type": "user_message",
+                    "text": last_user_text,
+                }))
+
+            async def _collect(ws: websockets.WebSocketClientProtocol) -> None:
+                nonlocal reply
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    t = msg.get("type", "")
+
+                    if t == "ping":
+                        eid = msg.get("ping_event", {}).get("event_id")
+                        await ws.send(json.dumps({"type": "pong", "event_id": eid}))
+                        continue
+
+                    if t == "agent_response":
+                        text = msg.get("agent_response_event", {}).get("agent_response", "")
+                        reply = (text or "").strip()
+                        return
+
+            async def _run_turn(ws: websockets.WebSocketClientProtocol) -> None:
+                await _send_turn(ws)
+                await asyncio.wait_for(_collect(ws), timeout=45)
+
+            ws = await self._ensure_connected(agent_id)
+            try:
+                await _run_turn(ws)
+            except Exception:
+                # Socket may be stale; drop it so next call reconnects
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                self.ws = None
+                # Retry once with a fresh socket
+                ws = await self._ensure_connected(agent_id)
+                reply = ""
+                await _run_turn(ws)
+
+            return reply
+
+    async def reset(self) -> None:
+        async with self.lock:
+            if self.ws is not None:
+                try:
+                    await self.ws.close()
+                except Exception:
+                    pass
+            self.ws = None
+
+
+_SESSIONS: dict[str, _ChatSession] = {}
+
+
+def _get_session(chat_key: str) -> _ChatSession:
+    s = _SESSIONS.get(chat_key)
+    if s is None:
+        s = _ChatSession()
+        _SESSIONS[chat_key] = s
+    return s
+
 
 def _el_headers() -> dict:
     return {"xi-api-key": settings.ELEVENLABS_API_KEY}
@@ -151,6 +279,7 @@ async def generate_text_reply(
     system_prompt: str,
     history: list[dict],
     lead_name: Optional[str] = None,
+    chat_key: Optional[str] = None,
 ) -> str:
     """
     Generate a text reply via ElevenLabs ConvAI WebSocket (text-only mode).
@@ -170,84 +299,46 @@ async def generate_text_reply(
     context_parts.append(WHATSAPP_CONTEXT)
     context_text = " ".join(context_parts)
 
-    signed_url = await _get_signed_url(agent_id)
-    reply = ""
-
+    key = chat_key or agent_id
+    session = _get_session(key)
     try:
-        async with websockets.connect(
-            signed_url,
-            ssl=_ssl_ctx(),
-            open_timeout=15,
-            close_timeout=10,
-        ) as ws:
-
-            # 1. Wait for conversation_initiation_metadata
-            async for raw in ws:
-                msg = json.loads(raw)
-                if msg.get("type") == "conversation_initiation_metadata":
-                    break
-
-            # 2. Enable text-only mode
-            await ws.send(json.dumps({
-                "type": "conversation_initiation_client_data",
-                "conversation_config_override": {
-                    "conversation": {"text_only": True},
-                },
-            }))
-
-            # 3. Inject prior conversation history
-            if prior_turns:
-                history_text = "\n".join(
-                    f"{'User' if m['role'] == 'user' else 'Agent'}: {m['content']}"
-                    for m in prior_turns
-                )
-                await ws.send(json.dumps({
-                    "type": "contextual_update",
-                    "text": f"Previous conversation:\n{history_text}",
-                }))
-
-            # 4. Send WhatsApp context hint
-            await ws.send(json.dumps({
-                "type": "contextual_update",
-                "text": context_text,
-            }))
-
-            # 5. Send user message
-            await ws.send(json.dumps({
-                "type": "user_message",
-                "text": last_user_text,
-            }))
-            logger.debug(f"user_message sent: {last_user_text[:60]}")
-
-            # 6. Collect agent_response
-            async def _collect():
-                nonlocal reply
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    t = msg.get("type", "")
-
-                    if t == "ping":
-                        eid = msg.get("ping_event", {}).get("event_id")
-                        await ws.send(json.dumps({"type": "pong", "event_id": eid}))
-
-                    elif t == "agent_response":
-                        text = msg.get("agent_response_event", {}).get("agent_response", "")
-                        reply = text.strip()
-                        await ws.close()
-                        return
-
-                    elif t in ("agent_chat_response_part", "internal_tentative_agent_response"):
-                        pass
-
-            await asyncio.wait_for(_collect(), timeout=45)
-
+        reply = await session.ask(
+            agent_id=agent_id,
+            context_text=context_text,
+            prior_turns=prior_turns,
+            last_user_text=last_user_text,
+        )
     except asyncio.TimeoutError:
         logger.warning("ElevenLabs WebSocket timeout after 45s")
-    except websockets.exceptions.ConnectionClosed as e:
-        logger.debug(f"WebSocket closed: {e}")
+        return ""
     except Exception as e:
-        logger.error(f"ElevenLabs WebSocket error: {e}")
-        raise
+        err = str(e).lower()
+        # One hard retry on websocket-level failures.
+        if (
+            "1011" in err
+            or "1002" in err
+            or "keepalive ping timeout" in err
+            or "connectionclosed" in err
+            or "failed to generate a response" in err
+        ):
+            logger.warning(f"ElevenLabs transient socket error, retrying once: {e}")
+            await session.reset()
+            try:
+                reply = await session.ask(
+                    agent_id=agent_id,
+                    context_text=context_text,
+                    prior_turns=prior_turns,
+                    last_user_text=last_user_text,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("ElevenLabs retry timed out after 45s")
+                return ""
+            except Exception as retry_err:
+                logger.error(f"ElevenLabs retry failed: {retry_err}")
+                return ""
+        else:
+            logger.error(f"ElevenLabs generate_text_reply failed: {e}")
+        return ""
 
     logger.info(f"ElevenLabs reply ({len(reply)} chars): {reply[:120]}")
     return reply

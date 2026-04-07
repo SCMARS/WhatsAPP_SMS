@@ -7,6 +7,7 @@ from typing import Optional
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.db.models import WhatsAppInstance
 
 logger = logging.getLogger(__name__)
@@ -46,12 +47,25 @@ async def get_best_instance(db: AsyncSession) -> Optional[WhatsAppInstance]:
             select(WhatsAppInstance).where(
                 WhatsAppInstance.is_active == True,
                 WhatsAppInstance.is_banned == False,
-            )
+            ).order_by(WhatsAppInstance.created_at.desc())
         )
         instances = result.scalars().all()
 
         if not instances:
             return None
+
+        # Prefer explicitly configured instance when available.
+        preferred_id = (getattr(settings, "INSTANCE_ID", "") or "").strip()
+        if preferred_id:
+            for inst in instances:
+                if inst.instance_id != preferred_id:
+                    continue
+                _prune(inst.instance_id)
+                if _hourly_count(inst.instance_id) >= inst.hourly_limit:
+                    break
+                if _daily_count(inst.instance_id) >= inst.daily_limit:
+                    break
+                return inst
 
         best: Optional[WhatsAppInstance] = None
         best_hourly = None

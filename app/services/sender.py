@@ -55,6 +55,12 @@ async def send_message(
             await instance_pool.mark_banned(db, instance.instance_id)
         else:
             logger.error(f"Send failed for {conversation.phone}: {e}")
+    else:
+        # Some Green API errors mean the instance is unusable (deleted/invalid).
+        # Mark it banned so the pool stops selecting it.
+        if status == "failed" and (error_text or "").lower().find("instance is deleted") != -1:
+            logger.warning(f"Instance {instance.instance_id} appears deleted/invalid, disabling it")
+            await instance_pool.mark_banned(db, instance.instance_id)
 
     if status in ("sent", "queued"):
         await instance_pool.record_send(instance.instance_id)
@@ -102,7 +108,20 @@ async def _do_send(
         pass
 
     if resp.status_code != 200:
-        error = data.get("message", f"HTTP {resp.status_code}")
+        # Green API often returns structured error; include raw text for debugging.
+        raw = ""
+        try:
+            raw = resp.text
+        except Exception:
+            raw = ""
+        error = data.get("message") or data.get("error") or (raw.strip() if raw else f"HTTP {resp.status_code}")
+        logger.warning(
+            "Green API sendMessage failed: status=%s instance_id=%s chat_id=%s body=%s",
+            resp.status_code,
+            instance.instance_id,
+            chat_id,
+            (raw[:500] if raw else data),
+        )
         return None, error, "failed"
 
     provider_id = data.get("idMessage")

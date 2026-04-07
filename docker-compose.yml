@@ -15,7 +15,7 @@ services:
     ports:
       - "5433:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U wrwa"]
+      test: ["CMD-SHELL", "pg_isready -U wrwa -d wr_whatsapp"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -32,7 +32,7 @@ services:
       - DEBUG=${DEBUG:-false}
       - PORT=8000
     ports:
-      - "8000:8000"
+      - "8001:8000"
     depends_on:
       postgres:
         condition: service_healthy

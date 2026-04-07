@@ -71,11 +71,15 @@ async def describe_image(
     """
     if not settings.GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not set, using placeholder for image")
+        if caption:
+            return f"[The customer sent a photo. Caption: {caption}]"
         return "[The customer sent a photo]"
 
     image_bytes = await _download_image(image_url, instance_id, api_token, message_id)
     if not image_bytes:
         logger.error("Could not download image from any source")
+        if caption:
+            return f"[The customer sent a photo (could not download). Caption: {caption}]"
         return "[The customer sent a photo that could not be downloaded]"
 
     # Detect mime type from magic bytes
