@@ -1,7 +1,7 @@
 version: "3.9"
 
-# LOCAL DEVELOPMENT only
-# For production use Railway
+# ONE COMMAND: docker compose up -d --build
+# Everything starts automatically: postgres, app, ngrok tunnel
 
 services:
   postgres:
@@ -29,16 +29,40 @@ services:
       - AGENT_ID=${AGENT_ID}
       - INSTANCE_ID=${INSTANCE_ID}
       - INSTANCE_API_TOKEN=${INSTANCE_API_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - DEBUG=${DEBUG:-false}
-      - PORT=8000
     ports:
       - "8001:8000"
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    volumes:
-      - .:/app  # hot reload for dev
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE=http://localhost:8001
+      - VITE_API_SECRET_KEY=${API_SECRET_KEY}
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command:
+      - "http"
+      - "--domain=unbewildering-unwilfully-marcelo.ngrok-free.dev"
+      - "app:8000"
+    environment:
+      - NGROK_AUTHTOKEN=35HWr5J0C5BuB6rsp53ta8kRWMm_52gtf61AdWrXoE833GjiC
+    ports:
+      - "4040:4040"
+    depends_on:
+      - app
+    restart: unless-stopped
 
 volumes:
   pgdata:

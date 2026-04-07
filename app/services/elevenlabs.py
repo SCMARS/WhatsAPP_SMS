@@ -2,9 +2,12 @@
 ElevenLabs integration — ConvAI WebSocket (text-only) + STT (Scribe).
 
 Conversation continuity:
-  - On first message: connect without conversation_id, save returned id to DB.
-  - On subsequent messages: append conversation_id as query param → ElevenLabs
-    resumes the SAME conversation (one chat per WhatsApp contact).
+  - One persistent WebSocket per WhatsApp chat (keyed by phone number).
+  - The socket is only replaced when ElevenLabs closes it server-side.
+  - We NEVER proactively close a working socket — ElevenLabs does it on their
+    own schedule (~5-10 min of idle). On reconnect we get a new conversation
+    context, but history is re-injected as contextual_update so the agent
+    stays grounded.
 """
 import asyncio
 import json
@@ -15,7 +18,7 @@ from typing import Optional
 import certifi
 import httpx
 import websockets
-from tenacity import retry, stop_after_attempt, wait_exponential
+from websockets.exceptions import ConnectionClosed
 
 from app.config import settings
 
@@ -28,43 +31,95 @@ WHATSAPP_CONTEXT = (
     "Plain text only, no markdown."
 )
 
+
+def _ssl_ctx() -> ssl.SSLContext:
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _el_headers() -> dict:
+    return {"xi-api-key": settings.ELEVENLABS_API_KEY}
+
+
+async def _get_signed_url(agent_id: str) -> str:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{ELEVENLABS_BASE}/convai/conversation/get_signed_url",
+            headers=_el_headers(),
+            params={"agent_id": agent_id},
+        )
+        resp.raise_for_status()
+        return resp.json()["signed_url"]
+
+
+async def _open_socket(agent_id: str) -> websockets.WebSocketClientProtocol:
+    """Open a fresh ElevenLabs ConvAI WebSocket and complete the handshake."""
+    signed_url = await _get_signed_url(agent_id)
+    ws = await websockets.connect(
+        signed_url,
+        ssl=_ssl_ctx(),
+        open_timeout=20,
+        close_timeout=10,
+        ping_interval=None,   # let ElevenLabs drive keepalive
+        ping_timeout=None,
+    )
+
+    # 1. Wait for server's initiation metadata
+    async for raw in ws:
+        msg = json.loads(raw)
+        if msg.get("type") == "conversation_initiation_metadata":
+            logger.debug("ElevenLabs WS: got initiation metadata")
+            break
+
+    # 2. Enable text-only mode (must be sent once per socket, right after metadata)
+    await ws.send(json.dumps({
+        "type": "conversation_initiation_client_data",
+        "conversation_config_override": {
+            "conversation": {"text_only": True},
+        },
+    }))
+
+    logger.info(f"ElevenLabs WS opened for agent={agent_id}")
+    return ws
+
+
+def _is_socket_alive(ws) -> bool:
+    """Return True only if the socket object exists and is still open."""
+    if ws is None:
+        return False
+    
+    # Handle newer websockets versions (14.0+)
+    if hasattr(ws, "state"):
+        # state is an Enum like State.OPEN (value 1)
+        state_name = getattr(ws.state, "name", "")
+        state_val = getattr(ws.state, "value", -1)
+        return state_name == "OPEN" or state_val == 1
+        
+    # Handle legacy websockets versions
+    return not getattr(ws, "closed", True)
+
+
+
 class _ChatSession:
+    """One persistent WS session per WhatsApp phone number."""
+
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.last_used = asyncio.get_event_loop().time()
 
     async def _ensure_connected(self, agent_id: str) -> websockets.WebSocketClientProtocol:
-        if self.ws is not None:
+        if _is_socket_alive(self.ws):
             return self.ws
 
-        signed_url = await _get_signed_url(agent_id)
-        ws = await websockets.connect(
-            signed_url,
-            ssl=_ssl_ctx(),
-            open_timeout=15,
-            close_timeout=10,
-            # Disable client-side keepalive timeout which caused false 1011 disconnects.
-            ping_interval=None,
-            ping_timeout=None,
-        )
+        # Socket is gone — open a new one
+        if self.ws is not None:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
 
-        # Wait for initiation metadata
-        async for raw in ws:
-            msg = json.loads(raw)
-            if msg.get("type") == "conversation_initiation_metadata":
-                break
-
-        # Enable text-only mode once per socket
-        await ws.send(json.dumps({
-            "type": "conversation_initiation_client_data",
-            "conversation_config_override": {
-                "conversation": {"text_only": True},
-            },
-        }))
-
-        self.ws = ws
-        return ws
+        logger.info(f"Opening new ElevenLabs WS (agent={agent_id})")
+        self.ws = await _open_socket(agent_id)
+        return self.ws
 
     async def ask(
         self,
@@ -74,11 +129,10 @@ class _ChatSession:
         last_user_text: str,
     ) -> str:
         async with self.lock:
-            self.last_used = asyncio.get_event_loop().time()
             reply = ""
 
             async def _send_turn(ws: websockets.WebSocketClientProtocol) -> None:
-                # Inject history + context each turn (cheap, keeps agent grounded)
+                # Re-inject history so agent stays grounded on reconnect
                 if prior_turns:
                     history_text = "\n".join(
                         f"{'User' if m['role'] == 'user' else 'Agent'}: {m['content']}"
@@ -122,17 +176,17 @@ class _ChatSession:
             ws = await self._ensure_connected(agent_id)
             try:
                 await _run_turn(ws)
-            except Exception:
-                # Socket may be stale; drop it so next call reconnects
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
+            except (ConnectionClosed, ConnectionError, OSError) as e:
+                # ElevenLabs closed the socket on their side — reconnect once
+                logger.warning(f"ElevenLabs WS closed mid-turn ({e}), reconnecting…")
                 self.ws = None
-                # Retry once with a fresh socket
                 ws = await self._ensure_connected(agent_id)
                 reply = ""
                 await _run_turn(ws)
+            except asyncio.TimeoutError:
+                # Don't kill the socket on timeout — it may still be valid
+                logger.warning("ElevenLabs _collect timed out after 45s")
+                raise
 
             return reply
 
@@ -146,6 +200,10 @@ class _ChatSession:
             self.ws = None
 
 
+# ---------------------------------------------------------------------------
+# Global session registry  (one session = one WhatsApp phone)
+# ---------------------------------------------------------------------------
+
 _SESSIONS: dict[str, _ChatSession] = {}
 
 
@@ -157,15 +215,76 @@ def _get_session(chat_key: str) -> _ChatSession:
     return s
 
 
-def _el_headers() -> dict:
-    return {"xi-api-key": settings.ELEVENLABS_API_KEY}
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+async def generate_text_reply(
+    agent_id: str,
+    system_prompt: str,
+    history: list[dict],
+    lead_name: Optional[str] = None,
+    chat_key: Optional[str] = None,
+) -> str:
+    """
+    Generate a text reply via ElevenLabs ConvAI WebSocket (text-only mode).
+    One persistent socket per WhatsApp chat. Reconnects automatically only
+    when ElevenLabs closes the connection.
+    """
+    user_messages = [m for m in history if m.get("role") == "user"]
+    if not user_messages:
+        logger.warning("No user messages in history")
+        return ""
+
+    last_user_text = user_messages[-1]["content"]
+    prior_turns = history[:-1]
+
+    context_parts = []
+    if lead_name:
+        context_parts.append(f"Customer name: {lead_name}.")
+    context_parts.append(WHATSAPP_CONTEXT)
+    context_text = " ".join(context_parts)
+
+    key = chat_key or agent_id
+    session = _get_session(key)
+
+    try:
+        reply = await session.ask(
+            agent_id=agent_id,
+            context_text=context_text,
+            prior_turns=prior_turns,
+            last_user_text=last_user_text,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("ElevenLabs WebSocket timeout after 45s")
+        return ""
+    except Exception as e:
+        err = str(e).lower()
+        if any(code in err for code in ("1011", "1002", "1000", "connectionclosed", "failed to generate")):
+            logger.warning(f"ElevenLabs transient socket error, hard-reset and retry: {e}")
+            await session.reset()
+            try:
+                reply = await session.ask(
+                    agent_id=agent_id,
+                    context_text=context_text,
+                    prior_turns=prior_turns,
+                    last_user_text=last_user_text,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("ElevenLabs retry timed out")
+                return ""
+            except Exception as retry_err:
+                logger.error(f"ElevenLabs retry failed: {retry_err}")
+                return ""
+        else:
+            import traceback
+            logger.error(f"ElevenLabs generate_text_reply failed:\n{traceback.format_exc()}")
+            return ""
+
+    logger.info(f"ElevenLabs reply ({len(reply)} chars): {reply[:120]}")
+    return reply
 
 
-def _ssl_ctx() -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=certifi.where())
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 async def get_agent_prompt(agent_id: str) -> dict:
     """Fetch full agent config from ElevenLabs. Returns prompt + first_message."""
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -186,17 +305,6 @@ async def get_agent_prompt(agent_id: str) -> dict:
         first_message = ""
 
     return {"prompt": prompt, "first_message": first_message}
-
-
-async def _get_signed_url(agent_id: str) -> str:
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{ELEVENLABS_BASE}/convai/conversation/get_signed_url",
-            headers=_el_headers(),
-            params={"agent_id": agent_id},
-        )
-        resp.raise_for_status()
-        return resp.json()["signed_url"]
 
 
 async def _download_audio(
@@ -272,73 +380,3 @@ async def transcribe_audio(
     except Exception as e:
         logger.error(f"Audio transcription failed: {e}")
         return None
-
-
-async def generate_text_reply(
-    agent_id: str,
-    system_prompt: str,
-    history: list[dict],
-    lead_name: Optional[str] = None,
-    chat_key: Optional[str] = None,
-) -> str:
-    """
-    Generate a text reply via ElevenLabs ConvAI WebSocket (text-only mode).
-    Sends full conversation history as contextual_update before the user message.
-    """
-    user_messages = [m for m in history if m.get("role") == "user"]
-    if not user_messages:
-        logger.warning("No user messages in history")
-        return ""
-
-    last_user_text = user_messages[-1]["content"]
-    prior_turns = history[:-1]
-
-    context_parts = []
-    if lead_name:
-        context_parts.append(f"Customer name: {lead_name}.")
-    context_parts.append(WHATSAPP_CONTEXT)
-    context_text = " ".join(context_parts)
-
-    key = chat_key or agent_id
-    session = _get_session(key)
-    try:
-        reply = await session.ask(
-            agent_id=agent_id,
-            context_text=context_text,
-            prior_turns=prior_turns,
-            last_user_text=last_user_text,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("ElevenLabs WebSocket timeout after 45s")
-        return ""
-    except Exception as e:
-        err = str(e).lower()
-        # One hard retry on websocket-level failures.
-        if (
-            "1011" in err
-            or "1002" in err
-            or "keepalive ping timeout" in err
-            or "connectionclosed" in err
-            or "failed to generate a response" in err
-        ):
-            logger.warning(f"ElevenLabs transient socket error, retrying once: {e}")
-            await session.reset()
-            try:
-                reply = await session.ask(
-                    agent_id=agent_id,
-                    context_text=context_text,
-                    prior_turns=prior_turns,
-                    last_user_text=last_user_text,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("ElevenLabs retry timed out after 45s")
-                return ""
-            except Exception as retry_err:
-                logger.error(f"ElevenLabs retry failed: {retry_err}")
-                return ""
-        else:
-            logger.error(f"ElevenLabs generate_text_reply failed: {e}")
-        return ""
-
-    logger.info(f"ElevenLabs reply ({len(reply)} chars): {reply[:120]}")
-    return reply

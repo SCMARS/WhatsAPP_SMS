@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -12,6 +13,15 @@ from app.services.gemini import describe_image
 from app.services.sender import send_message
 
 logger = logging.getLogger(__name__)
+_CHAT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_chat_lock(chat_key: str) -> asyncio.Lock:
+    lock = _CHAT_LOCKS.get(chat_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHAT_LOCKS[chat_key] = lock
+    return lock
 
 
 async def handle_incoming(
@@ -47,6 +57,32 @@ async def handle_incoming(
     if digits:
         phone_variants.add(digits)
         phone_variants.add(f"+{digits}")
+    chat_lock_key = digits or phone
+    chat_lock = _get_chat_lock(chat_lock_key)
+
+    async with chat_lock:
+        await _handle_incoming_locked(
+            db=db,
+            payload=payload,
+            instance_id=instance_id,
+            phone=phone,
+            digits=digits,
+            phone_variants=phone_variants,
+            provider_message_id=provider_message_id,
+            chat_id=chat_id,
+        )
+
+
+async def _handle_incoming_locked(
+    db: AsyncSession,
+    payload: dict[str, Any],
+    instance_id: str,
+    phone: str,
+    digits: str,
+    phone_variants: set[str],
+    provider_message_id: Optional[str],
+    chat_id: str,
+) -> None:
 
     message_data = payload.get("messageData", {})
     msg_type = message_data.get("typeMessage", "")
