@@ -12,7 +12,31 @@ logger = logging.getLogger(__name__)
 
 def _format_phone(phone: str) -> str:
     digits = "".join(c for c in phone if c.isdigit())
-    return f"{digits}@c.us"
+    if not digits.endswith("@c.us"):
+        return f"{digits}@c.us"
+    return digits
+
+
+async def read_chat(db: AsyncSession, conversation: Conversation) -> bool:
+    """Mark a chat as read in Green API. This helps with E2EE sync."""
+    instance = await instance_pool.get_best_instance(db, is_reservation=False)
+    if not instance:
+        return False
+
+    chat_id = _format_phone(conversation.phone)
+    url = (
+        f"https://7107.api.greenapi.com"
+        f"/waInstance{instance.instance_id}"
+        f"/readChat/{instance.api_token}"
+    )
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(url, json={"chatId": chat_id})
+            return resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Failed to readChat for {chat_id}: {e}")
+        return False
 
 
 async def send_message(
@@ -22,8 +46,11 @@ async def send_message(
     lead_name: Optional[str] = None,
     batch_index: int = 0,
     is_reply: bool = False,
+    instance: Optional[WhatsAppInstance] = None,
 ) -> Optional[WhatsAppMessage]:
-    instance = await instance_pool.get_best_instance(db)
+    if not instance:
+        instance = await instance_pool.get_best_instance(db)
+    
     if not instance:
         logger.error("No available WhatsApp instances in pool")
         return None
@@ -82,21 +109,57 @@ async def send_message(
     return msg
 
 
+def calc_typing_time(message: str) -> int:
+    import random
+    chars = len(message)
+    ms = (chars / 3) * 1000  # 3 chars per sec
+    ms = ms * random.uniform(0.8, 1.2)  # +- 20% jitter
+    return int(max(2000, min(ms, 8000)))  # Cap between 2 and 8 secs
+
+
 async def _do_send(
     instance: WhatsAppInstance,
     chat_id: str,
     text: str,
 ) -> tuple[Optional[str], Optional[str], str]:
-    """Send message via Green API using direct httpx call. Returns (provider_id, error, status)."""
+    """Send typing indicator, wait, then send message via Green API. Returns (provider_id, error, status)."""
     import httpx
+
+    import asyncio
+    
+    # Send "typing..." indicator first
+    typing_ms = calc_typing_time(text)
+    typing_url = (
+        f"https://7107.api.greenapi.com"
+        f"/waInstance{instance.instance_id}"
+        f"/sendTyping/{instance.api_token}"
+    )
+    typing_payload = {
+        "chatId": chat_id,
+        "typingTime": typing_ms
+    }
 
     url = (
         f"https://7107.api.greenapi.com"
         f"/waInstance{instance.instance_id}"
         f"/sendMessage/{instance.api_token}"
     )
+    payload = {
+        "chatId": chat_id,
+        "message": text,
+        "linkPreview": False,  # Simpler payload to avoid E2EE sync delays
+    }
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, json={"chatId": chat_id, "message": text})
+        try:
+            # 1. Fire typing indicator
+            await client.post(typing_url, json=typing_payload)
+            # 2. Emulate the typing duration waiting time block
+            await asyncio.sleep(typing_ms / 1000.0)
+        except Exception as e:
+            logger.warning(f"Failed to send typing indicator: {e}")
+            
+        # 3. Actually send the message
+        resp = await client.post(url, json=payload)
 
     if resp.status_code in (403, 429):
         raise RuntimeError(f"HTTP {resp.status_code} from Green API — likely banned/rate-limited")
@@ -125,19 +188,45 @@ async def _do_send(
         return None, error, "failed"
 
     provider_id = data.get("idMessage")
+    if provider_id:
+        logger.info(f"Green API: message sent, provider_id={provider_id}")
     return provider_id, None, "sent"
 
 
 async def send_initial_message(
     db: AsyncSession,
     conversation: Conversation,
-    initial_text: str,
+    initial_text: str | list[str],
     batch_index: int = 0,
 ) -> Optional[WhatsAppMessage]:
-    return await send_message(
-        db=db,
-        conversation=conversation,
-        text=initial_text,
-        lead_name=conversation.lead_name,
-        batch_index=batch_index,
-    )
+    messages = [initial_text] if isinstance(initial_text, str) else initial_text
+    last_msg = None
+    selected_instance = None
+
+    for i, text in enumerate(messages):
+        # 1st message: Selects and reserves instance (4 min cooldown)
+        # Subsequent: Reuses same instance with short typing delay
+        is_seq = i > 0
+        
+        msg = await send_message(
+            db=db,
+            conversation=conversation,
+            text=text,
+            lead_name=conversation.lead_name,
+            batch_index=batch_index,
+            is_reply=is_seq,
+            instance=selected_instance,
+        )
+        if i == 0:
+            last_msg = msg
+            if msg:
+                # Get the instance object back to reuse its ID/ID
+                from sqlalchemy import select
+                res = await db.execute(select(WhatsAppInstance).where(WhatsAppInstance.id == msg.instance_id))
+                selected_instance = res.scalar_one_or_none()
+        
+        # If there are more messages, wait a bit before the next one
+        if i < len(messages) - 1:
+            await reply_pause(min_sec=3.0, max_sec=6.0)
+            
+    return last_msg

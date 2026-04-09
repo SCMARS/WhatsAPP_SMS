@@ -51,7 +51,7 @@ async def _get_signed_url(agent_id: str) -> str:
         return resp.json()["signed_url"]
 
 
-async def _open_socket(agent_id: str) -> websockets.WebSocketClientProtocol:
+async def _open_socket(agent_id: str, language: Optional[str] = None) -> websockets.WebSocketClientProtocol:
     """Open a fresh ElevenLabs ConvAI WebSocket and complete the handshake."""
     signed_url = await _get_signed_url(agent_id)
     ws = await websockets.connect(
@@ -70,15 +70,16 @@ async def _open_socket(agent_id: str) -> websockets.WebSocketClientProtocol:
             logger.debug("ElevenLabs WS: got initiation metadata")
             break
 
-    # 2. Enable text-only mode (must be sent once per socket, right after metadata)
+    # 2. Enable text-only mode + optional language override
+    config_override: dict = {"conversation": {"text_only": True}}
+    if language:
+        config_override["agent"] = {"language": language}
+
     await ws.send(json.dumps({
         "type": "conversation_initiation_client_data",
-        "conversation_config_override": {
-            "conversation": {"text_only": True},
-        },
+        "conversation_config_override": config_override,
     }))
 
-    logger.info(f"ElevenLabs WS opened for agent={agent_id}")
     return ws
 
 
@@ -98,27 +99,37 @@ def _is_socket_alive(ws) -> bool:
     return not getattr(ws, "closed", True)
 
 
-
 class _ChatSession:
     """One persistent WS session per WhatsApp phone number."""
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._language: Optional[str] = None
 
-    async def _ensure_connected(self, agent_id: str) -> websockets.WebSocketClientProtocol:
-        if _is_socket_alive(self.ws):
+    async def _ensure_connected(
+        self, agent_id: str, language: Optional[str] = None
+    ) -> websockets.WebSocketClientProtocol:
+        # If language changed, force reconnect to use new config
+        if _is_socket_alive(self.ws) and self._language == language:
             return self.ws
+        if _is_socket_alive(self.ws) and self._language != language:
+            logger.info(f"Language changed {self._language}→{language}, reconnecting WS")
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
 
-        # Socket is gone — open a new one
         if self.ws is not None:
             try:
                 await self.ws.close()
             except Exception:
                 pass
 
-        logger.info(f"Opening new ElevenLabs WS (agent={agent_id})")
-        self.ws = await _open_socket(agent_id)
+        logger.info(f"Opening new ElevenLabs WS (agent={agent_id}, lang={language})")
+        self.ws = await _open_socket(agent_id, language=language)
+        self._language = language
         return self.ws
 
     async def ask(
@@ -127,64 +138,91 @@ class _ChatSession:
         context_text: str,
         prior_turns: list[dict],
         last_user_text: str,
+        language: Optional[str] = None,
     ) -> str:
         async with self.lock:
             reply = ""
 
-            async def _send_turn(ws: websockets.WebSocketClientProtocol) -> None:
+            ws = await self._ensure_connected(agent_id, language=language)
+
+            # --- DRAIN BUFFER ---
+            # Anything sitting in the buffer now (like an automated ElevenLabs greeting)
+            # belongs to a previous turn or connection greeting. Clear it.
+            try:
+                while True:
+                    # Give it a bit more time to catch the initial "Hey" (1.0s)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    msg = json.loads(raw)
+                    if msg.get("type") == "agent_response":
+                        txt = msg.get("agent_response_event", {}).get("agent_response", "")
+                        logger.info(f"ElevenLabs WS: drained/discarded old greeting: '{txt}'")
+                    else:
+                        logger.debug(f"ElevenLabs WS: drained msg type='{msg.get('type')}'")
+            except asyncio.TimeoutError:
+                # Buffer is clean
+                pass
+            except Exception as e:
+                logger.debug(f"Stop draining buffer: {e}")
+
+            # --- TURN HANDLERS ---
+            async def _send_turn(w: websockets.WebSocketClientProtocol) -> None:
                 # Re-inject history so agent stays grounded on reconnect
                 if prior_turns:
                     history_text = "\n".join(
                         f"{'User' if m['role'] == 'user' else 'Agent'}: {m['content']}"
                         for m in prior_turns
                     )
-                    await ws.send(json.dumps({
+                    await w.send(json.dumps({
                         "type": "contextual_update",
                         "text": f"Previous conversation:\n{history_text}",
                     }))
 
-                await ws.send(json.dumps({
+                await w.send(json.dumps({
                     "type": "contextual_update",
                     "text": context_text,
                 }))
 
-                await ws.send(json.dumps({
+                await w.send(json.dumps({
                     "type": "user_message",
                     "text": last_user_text,
                 }))
 
-            async def _collect(ws: websockets.WebSocketClientProtocol) -> None:
+            async def _collect(w: websockets.WebSocketClientProtocol) -> None:
                 nonlocal reply
-                async for raw in ws:
+                async for raw in w:
                     msg = json.loads(raw)
                     t = msg.get("type", "")
 
                     if t == "ping":
                         eid = msg.get("ping_event", {}).get("event_id")
-                        await ws.send(json.dumps({"type": "pong", "event_id": eid}))
+                        await w.send(json.dumps({"type": "pong", "event_id": eid}))
                         continue
 
                     if t == "agent_response":
                         text = msg.get("agent_response_event", {}).get("agent_response", "")
-                        reply = (text or "").strip()
+                        if text:
+                            reply = text.strip()
+                            return
+                        else:
+                            continue
+
+                    if t == "internal_error":
+                        logger.error(f"ElevenLabs internal error: {msg}")
                         return
 
-            async def _run_turn(ws: websockets.WebSocketClientProtocol) -> None:
-                await _send_turn(ws)
-                await asyncio.wait_for(_collect(ws), timeout=45)
+            async def _run_turn(w: websockets.WebSocketClientProtocol) -> None:
+                await _send_turn(w)
+                await asyncio.wait_for(_collect(w), timeout=45)
 
-            ws = await self._ensure_connected(agent_id)
             try:
                 await _run_turn(ws)
             except (ConnectionClosed, ConnectionError, OSError) as e:
-                # ElevenLabs closed the socket on their side — reconnect once
                 logger.warning(f"ElevenLabs WS closed mid-turn ({e}), reconnecting…")
                 self.ws = None
-                ws = await self._ensure_connected(agent_id)
+                ws = await self._ensure_connected(agent_id, language=language)
                 reply = ""
                 await _run_turn(ws)
             except asyncio.TimeoutError:
-                # Don't kill the socket on timeout — it may still be valid
                 logger.warning("ElevenLabs _collect timed out after 45s")
                 raise
 
@@ -225,11 +263,13 @@ async def generate_text_reply(
     history: list[dict],
     lead_name: Optional[str] = None,
     chat_key: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> str:
     """
     Generate a text reply via ElevenLabs ConvAI WebSocket (text-only mode).
     One persistent socket per WhatsApp chat. Reconnects automatically only
     when ElevenLabs closes the connection.
+    language: ISO code like 'pt', 'es', 'en' — passed to ElevenLabs agent config override.
     """
     user_messages = [m for m in history if m.get("role") == "user"]
     if not user_messages:
@@ -254,6 +294,7 @@ async def generate_text_reply(
             context_text=context_text,
             prior_turns=prior_turns,
             last_user_text=last_user_text,
+            language=language,
         )
     except asyncio.TimeoutError:
         logger.warning("ElevenLabs WebSocket timeout after 45s")
@@ -269,6 +310,7 @@ async def generate_text_reply(
                     context_text=context_text,
                     prior_turns=prior_turns,
                     last_user_text=last_user_text,
+                    language=language,
                 )
             except asyncio.TimeoutError:
                 logger.warning("ElevenLabs retry timed out")

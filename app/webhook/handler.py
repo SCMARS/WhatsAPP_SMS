@@ -6,11 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.models import Campaign, Conversation, WhatsAppMessage
+from app.db.models import Campaign, Conversation, WhatsAppMessage, Blacklist
 from app.services.blacklist import add_to_blacklist, is_blacklisted, is_stop_message
 from app.services.elevenlabs import generate_text_reply, get_agent_prompt, transcribe_audio
 from app.services.gemini import describe_image
-from app.services.sender import send_message
+from app.services.sender import send_message, read_chat
 
 logger = logging.getLogger(__name__)
 _CHAT_LOCKS: dict[str, asyncio.Lock] = {}
@@ -231,6 +231,9 @@ async def _handle_incoming_locked(
         await db.refresh(conversation)
         logger.info(f"Auto-created conversation for inbound phone {conversation.phone}")
 
+    # 6a. Mark as READ in WhatsApp to trigger E2EE key sync
+    await read_chat(db, conversation)
+
     # 7. Save inbound message
     inbound_msg = WhatsAppMessage(
         conversation_id=conversation.id,
@@ -242,66 +245,52 @@ async def _handle_incoming_locked(
     db.add(inbound_msg)
     await db.commit()
 
-    # 8. Load last 10 messages for history
+    # 8. Ignore if user already replied (Anna logic: only 1 reply total)
+    inbound_res = await db.execute(
+        select(WhatsAppMessage).where(
+            WhatsAppMessage.conversation_id == conversation.id,
+            WhatsAppMessage.direction == "inbound"
+        )
+    )
+    # The current message is already saved, so if count > 1, it's a second/third message.
+    if len(inbound_res.scalars().all()) > 1:
+        logger.info(f"Phone {phone} already replied. Ignoring subsequent messages as per Anna logic.")
+        return
+
+    # 9. Load last few messages for context
     result = await db.execute(
         select(WhatsAppMessage)
         .where(WhatsAppMessage.conversation_id == conversation.id)
         .order_by(WhatsAppMessage.created_at.desc())
-        .limit(10)
+        .limit(5)
     )
     recent_messages = list(reversed(result.scalars().all()))
+    llm_history = [{"role": ("user" if m.direction == "inbound" else "assistant"), "content": m.body} for m in recent_messages]
 
-    # 9. Build llm_history
-    llm_history = []
-    for msg in recent_messages:
-        role = "user" if msg.direction == "inbound" else "assistant"
-        llm_history.append({"role": role, "content": msg.body})
-
-    # 10. Get Campaign and agent_prompt cache
-    result = await db.execute(
-        select(Campaign).where(Campaign.id == conversation.campaign_id)
-    )
+    # 10. Get Campaign info
+    result = await db.execute(select(Campaign).where(Campaign.id == conversation.campaign_id))
     campaign = result.scalar_one_or_none()
-
     if not campaign:
         logger.error(f"Campaign not found for conversation {conversation.id}")
         return
 
-    # 11. Fetch and cache agent_prompt if empty
-    if not campaign.agent_prompt:
-        try:
-            agent_data = await get_agent_prompt(campaign.agent_id)
-            campaign.agent_prompt = agent_data["prompt"]
-            await db.commit()
-        except Exception as e:
-            logger.error(f"Failed to fetch agent prompt for campaign {campaign.id}: {e}")
-            return
-
-    # 12. Generate reply
+    # 11. Generate reply via ElevenLabs
     try:
         reply = await generate_text_reply(
             agent_id=campaign.agent_id,
             system_prompt=campaign.agent_prompt,
             history=llm_history,
             lead_name=conversation.lead_name,
-            # Keep one ElevenLabs conversation per WhatsApp chat/phone
             chat_key=conversation.phone,
         )
     except Exception as e:
-        logger.error(f"ElevenLabs generate_text_reply failed: {e}")
-        reply = (
-            "Извините, сейчас есть задержка с ассистентом. "
-            "Я получил ваше сообщение и скоро отвечу подробнее."
-        )
+        logger.error(f"ElevenLabs failed: {e}")
+        reply = "Привет! По всем вопросам бонуса тебе лучше всего подскажут в нашем онлайн-чате на сайте. Заглядывай туда! 😉"
 
     if not reply:
-        logger.warning(f"Empty reply from ElevenLabs for conversation {conversation.id}")
-        reply = (
-            "Получил ваше сообщение. Если удобно, напишите чуть подробнее, "
-            "и я сразу помогу."
-        )
+        reply = "За подробностями по бонусу и условиям заходи к нам в чат поддержки на сайте, там помогут за секунду! ✨"
 
-    # 13. Send reply
+    # 12. Send reply
     await send_message(
         db=db,
         conversation=conversation,

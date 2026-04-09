@@ -33,6 +33,7 @@ class WhatsAppInstance(Base):
     max_delay_sec: Mapped[int] = mapped_column(Integer, default=25, nullable=False)
     health_status: Mapped[str] = mapped_column(String(50), default="unknown", nullable=False)
     last_health_check: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_send_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -109,3 +110,20 @@ class Blacklist(Base):
     phone: Mapped[str] = mapped_column(String(30), unique=True, nullable=False)
     reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class LinkPool(Base):
+    __tablename__ = "links_pool"
+    __table_args__ = (
+        Index("ix_links_pool_country_used", "country", "used"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    url: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    country: Mapped[str] = mapped_column(String(10), nullable=False)  # "PT", "AR", etc.
+    used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lead_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

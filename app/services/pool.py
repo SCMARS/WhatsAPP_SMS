@@ -41,13 +41,16 @@ def _daily_count(instance_id: str) -> int:
     return len(_send_log[instance_id])
 
 
-async def get_best_instance(db: AsyncSession) -> Optional[WhatsAppInstance]:
+async def get_best_instance(db: AsyncSession, is_reservation: bool = True) -> Optional[WhatsAppInstance]:
     async with _lock:
         result = await db.execute(
             select(WhatsAppInstance).where(
                 WhatsAppInstance.is_active == True,
                 WhatsAppInstance.is_banned == False,
-            ).order_by(WhatsAppInstance.created_at.desc())
+            ).order_by(
+                WhatsAppInstance.last_send_at.asc().nulls_first(),
+                WhatsAppInstance.created_at.desc()
+            )
         )
         instances = result.scalars().all()
 
@@ -83,6 +86,24 @@ async def get_best_instance(db: AsyncSession) -> Optional[WhatsAppInstance]:
             if best is None or hourly < best_hourly:
                 best = inst
                 best_hourly = hourly
+
+        if best and is_reservation:
+            now = _now_utc()
+            # Pro Sender: Random gap between 90 and 180 seconds for human-like pattern
+            import random
+            gap_seconds = random.uniform(90, 180)
+            
+            # Use instance min_delay_sec if it's larger for custom tuning.
+            gap = max(gap_seconds, best.min_delay_sec)
+
+            # Previous reservation
+            prev_at = best.last_send_at or (now - timedelta(seconds=gap + 1))
+
+            # New reservation: at least 'gap' seconds from the previous reservation/send.
+            best.last_send_at = max(now, prev_at + timedelta(seconds=gap))
+
+            await db.commit()
+            await db.refresh(best)
 
         return best
 

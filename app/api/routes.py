@@ -1,11 +1,12 @@
 import logging
 import asyncio
+import random
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import Integer, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -14,6 +15,8 @@ from app.db.session import AsyncSessionLocal, get_db
 from app.services.elevenlabs import generate_text_reply, get_agent_prompt
 from app.services import pool as instance_pool
 from app.services.blacklist import is_blacklisted
+from app.services.country import detect_country
+from app.services.link_pool import claim_link, load_links
 from app.services.sender import send_initial_message
 from app.webhook.handler import handle_incoming
 
@@ -26,44 +29,31 @@ async def _resolve_initial_message(
     lead_name: Optional[str],
     phone: str,
     provided: Optional[str],
-) -> str:
-    # 1) If explicitly provided in payload/CSV -> use it.
-    initial_text = (provided or "").strip()
-    if initial_text:
-        return initial_text
-
-    # 2) Prefer ElevenLabs agent first_message.
+    language: Optional[str] = None,
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> list[str]:
+    import phonenumbers
+    
+    country = "PT"
     try:
-        agent_data = await get_agent_prompt(campaign.agent_id)
-    except Exception as e:
-        logger.error(f"Failed to fetch agent first_message for campaign {campaign.id}: {e}")
-        agent_data = {}
+        parsed = phonenumbers.parse(f"+{phone.lstrip('+')}")
+        country = phonenumbers.region_code_for_number(parsed)
+    except Exception:
+        pass
 
-    initial_text = (agent_data.get("first_message") or "").strip()
-    if initial_text:
-        return initial_text
+    if country == "AR" or language == "es":
+        # Argentina / Pampas script
+        msg1 = f"¡Hola! Acá Olivia de Pampas 🙂 Fue un placer charlar con vos."
+        msg2 = f"Como te prometí, acá tenés el link para tu bono del 175% en tu próximo dep. desde ARS 5000 · Solo por 5 días 👉 {link_url}"
+        msg3 = "El link se va a habilitar para hacer clic si respondés con cualquier mensaje en este chat (¡hasta un emoji sirve!) :) Muchos éxitos 🤞😉"
+    else:
+        # Default European Portuguese / Oro Casino script
+        msg1 = f"Olá! Aqui é a Camila do Oro Casino 🙂 Foi um prazer falar contigo."
+        msg2 = f"Como prometido, aqui está o teu código promocional: 50Pragmatic. 50 Rodadas Grátis na Pragmatic Play · Apenas por 5 dias 👉 {link_url}"
+        msg3 = "O link ficará clicável se me enviares qualquer mensagem de volta neste chat (nem que seja um emoji) :) Boa sorte 🤞😉"
 
-    # 3) If first_message is empty, ask ElevenLabs to generate opening line.
-    try:
-        generated = await generate_text_reply(
-            agent_id=campaign.agent_id,
-            system_prompt=campaign.agent_prompt or "",
-            history=[{"role": "user", "content": "Сформулируй первое короткое приветственное сообщение клиенту."}],
-            lead_name=lead_name,
-            chat_key=phone,
-        )
-    except Exception as e:
-        logger.error(f"Failed to generate initial message via ElevenLabs for {phone}: {e}")
-        generated = ""
-    generated = (generated or "").strip()
-    if generated:
-        return generated
-
-    # 4) No hardcoded fallback: force proper ElevenLabs/campaign setup.
-    raise HTTPException(
-        status_code=422,
-        detail="Cannot build initial message from ElevenLabs. Set agent first_message or provide initial_message.",
-    )
+    return [msg1, msg2, msg3]
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +71,20 @@ async def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> No
 
 class SendRequest(BaseModel):
     phone: str
-    lead_id: str
+    lead_id: Optional[str] = None           # auto-filled from phone if not provided
     lead_name: Optional[str] = None
-    campaign_external_id: str
+    campaign_external_id: Optional[str] = None  # auto-detected from phone prefix if omitted
     initial_message: Optional[str] = None
     batch_index: int = 0
+
+
+class LinkLoadItem(BaseModel):
+    url: str
+    country: str  # "PT", "AR", etc.
+
+
+class LinkLoadRequest(BaseModel):
+    links: list[LinkLoadItem]
 
 
 class InstanceCreateRequest(BaseModel):
@@ -191,21 +190,48 @@ async def update_default_agent(
 @router.post("/api/send", dependencies=[Depends(require_api_key)])
 async def send_message_endpoint(
     req: SendRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
-    # 1. Blacklist check
+    # 1. Detect country from phone
+    country_info = detect_country(req.phone)
+    country_code = country_info["code"]
+    lang = country_info["lang"]
+    promo = country_info["promo"]
+    campaign_key = req.campaign_external_id or country_info["campaign"]
+    lead_id = req.lead_id or req.phone
+
+    logger.info(f"Incoming /api/send phone={req.phone} country={country_code} campaign={campaign_key} lang={lang}")
+
+    # 2. Blacklist check
     if await is_blacklisted(db, req.phone):
         return {"status": "blacklisted"}
 
-    # 2. Find campaign
+    # 3. Claim a link from the pool (block if exhausted)
+    link_url = await claim_link(db, country_code, lead_id)
+    if link_url is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Link pool exhausted for country={country_code}. Load more links via POST /api/links/load",
+        )
+
+    # 4. Find or auto-create campaign
     result = await db.execute(
-        select(Campaign).where(Campaign.external_id == req.campaign_external_id)
+        select(Campaign).where(Campaign.external_id == campaign_key)
     )
     campaign = result.scalar_one_or_none()
     if not campaign:
-        raise HTTPException(status_code=404, detail=f"Campaign '{req.campaign_external_id}' not found")
+        campaign = Campaign(
+            external_id=campaign_key,
+            name=country_info["name"],
+            agent_id=(settings.AGENT_ID or "").strip() or "default-agent",
+        )
+        db.add(campaign)
+        await db.commit()
+        await db.refresh(campaign)
+        logger.info(f"Auto-created campaign '{campaign_key}' for country={country_code}")
 
-    # 3. Find or create conversation
+    # 5. Find or create conversation
     result = await db.execute(
         select(Conversation).where(
             Conversation.campaign_id == campaign.id,
@@ -217,7 +243,7 @@ async def send_message_endpoint(
     if conversation is None:
         conversation = Conversation(
             campaign_id=campaign.id,
-            lead_id=req.lead_id,
+            lead_id=lead_id,
             phone=req.phone,
             lead_name=req.lead_name,
             status="active",
@@ -228,30 +254,68 @@ async def send_message_endpoint(
     elif conversation.status == "stopped":
         return {"status": "skipped"}
 
-    # 4. Determine initial message via ElevenLabs
+    # 6. Build initial message
     initial_text = await _resolve_initial_message(
         campaign=campaign,
         lead_name=req.lead_name,
         phone=req.phone,
         provided=req.initial_message,
+        language=lang,
+        link_url=link_url,
+        promo_code=promo,
     )
 
-    # 5. Send initial message
-    msg = await send_initial_message(
-        db=db,
-        conversation=conversation,
-        initial_text=initial_text,
-        batch_index=req.batch_index,
-    )
+    # Helper function to run send in a fresh session so the current HTTP request can close
+    async def bg_send_task(conv_id: str, texts: list[str], batch_idx: int):
+        from app.db.session import AsyncSessionLocal
+        async with AsyncSessionLocal() as bg_db:
+            res = await bg_db.execute(select(Conversation).where(Conversation.id == conv_id))
+            conv = res.scalar_one_or_none()
+            if conv:
+                await send_initial_message(bg_db, conv, texts, batch_idx)
 
-    if msg is None:
-        raise HTTPException(status_code=503, detail="No available WhatsApp instances")
+    # Queue the background task
+    background_tasks.add_task(bg_send_task, conversation.id, initial_text, req.batch_index)
 
     return {
-        "status": "sent",
-        "message_id": str(msg.id),
+        "status": "queued",
         "conversation_id": str(conversation.id),
+        "country": country_code,
+        "lang": lang,
+        "link_url": link_url,
     }
+
+
+@router.post("/api/links/load", dependencies=[Depends(require_api_key)])
+async def load_links_endpoint(
+    req: LinkLoadRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Bulk-load affiliate links into the pool."""
+    items = [{"url": item.url, "country": item.country} for item in req.links]
+    result = await load_links(db, items)
+    return result
+
+
+@router.get("/api/links/stats", dependencies=[Depends(require_api_key)])
+async def links_stats_endpoint(
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Show how many links are free/used per country."""
+    from sqlalchemy import func as sqlfunc
+    from app.db.models import LinkPool
+    rows = await db.execute(
+        select(
+            LinkPool.country,
+            sqlfunc.count().label("total"),
+            sqlfunc.sum((~LinkPool.used).cast(Integer)).label("free"),
+        ).group_by(LinkPool.country)
+    )
+    stats = [
+        {"country": r.country, "total": r.total, "free": r.free or 0}
+        for r in rows.all()
+    ]
+    return {"stats": stats}
 
 
 @router.post("/api/send/bulk", dependencies=[Depends(require_api_key)])
@@ -308,13 +372,28 @@ async def bulk_send_endpoint(
             results.append({"phone": lead.phone, "status": "skipped"})
             continue
 
-        # Determine initial message via ElevenLabs
+        # Determine country and link
+        country_info = detect_country(lead.phone)
+        country_code = country_info["code"]
+        lang = country_info["lang"]
+        promo = country_info["promo"]
+        lead_id = lead.lead_id or lead.phone
+
+        link_url = await claim_link(db, country_code, lead_id)
+        if link_url is None:
+            results.append({"phone": lead.phone, "status": "error", "detail": f"link pool exhausted for {country_code}"})
+            continue
+
+        # Determine initial message via ElevenLabs (returns list[str])
         try:
             initial_text = await _resolve_initial_message(
                 campaign=campaign,
                 lead_name=lead.lead_name,
                 phone=lead.phone,
                 provided=lead.initial_message,
+                language=lang,
+                link_url=link_url,
+                promo_code=promo,
             )
         except HTTPException as e:
             results.append({"phone": lead.phone, "status": "error", "detail": e.detail})

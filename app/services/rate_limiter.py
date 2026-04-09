@@ -16,22 +16,27 @@ GREETINGS = [
 ]
 
 
-async def reply_pause(min_sec: float = 2.0, max_sec: float = 5.0) -> None:
-    """Short human-like typing delay before sending an AI reply."""
+async def reply_pause(min_sec: float = 4.0, max_sec: float = 8.0) -> None:
+    """Short human-like typing delay before sending next message in split sequence."""
     delay = random.uniform(min_sec, max_sec)
     logger.debug(f"Reply pause: {delay:.1f}s")
     await asyncio.sleep(delay)
 
 
 async def wait_before_send(instance: WhatsAppInstance) -> None:
-    min_sec = instance.min_delay_sec
-    max_sec = instance.max_delay_sec
-    mu = (min_sec + max_sec) / 2
-    sigma = (max_sec - min_sec) / 6
-    delay = random.gauss(mu=mu, sigma=sigma)
-    delay = max(min_sec, min(max_sec, delay))
-    logger.debug(f"Waiting {delay:.1f}s before send (instance {instance.instance_id})")
-    await asyncio.sleep(delay)
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    target = instance.last_send_at
+    if not target:
+        return
+
+    wait = (target - now).total_seconds()
+    if wait > 0:
+        # Add random jitter so we don't send *exactly* at 240.00s every time
+        jitter = random.uniform(2.0, 10.0)
+        actual_wait = wait + jitter
+        logger.info(f"Instance {instance.instance_id} is in cooldown, waiting {actual_wait:.1f}s")
+        await asyncio.sleep(actual_wait)
 
 
 async def batch_pause(batch_index: int, batch_size: int = 10, pause_sec: float = 120.0) -> None:
