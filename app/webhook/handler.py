@@ -29,8 +29,55 @@ async def handle_incoming(
     payload: dict[str, Any],
     instance_id: str,
 ) -> None:
-    # 1. Filter: only incomingMessageReceived
     type_webhook = payload.get("typeWebhook")
+
+    # ── outgoingMessageStatus: noAccount ──────────────────────────────────────
+    # Green API fires this when a sent message could not be delivered because the
+    # destination number has no WhatsApp account.  We blacklist the number so we
+    # never try it again (no separate checkWhatsapp pre-flight needed).
+    if type_webhook == "outgoingMessageStatus":
+        status = payload.get("status", "")
+        if status == "noAccount":
+            chat_id = payload.get("chatId", "")
+            phone = chat_id.split("@")[0] if "@" in chat_id else chat_id
+            if phone:
+                await add_to_blacklist(db, phone, reason="noAccount")
+                logger.warning(
+                    f"[noAccount] {phone} has no WhatsApp account — added to blacklist "
+                    f"(idMessage={payload.get('idMessage')})"
+                )
+                # Also mark the corresponding outbound message as failed in DB
+                provider_message_id = payload.get("idMessage")
+                if provider_message_id:
+                    from sqlalchemy import update as sa_update
+                    await db.execute(
+                        sa_update(WhatsAppMessage)
+                        .where(WhatsAppMessage.provider_message_id == provider_message_id)
+                        .values(status="failed", error="noAccount")
+                    )
+                    await db.commit()
+        return
+
+    # ── instanceData: yellowCard ──────────────────────────────────────────────
+    # Green API pushes a webhook when the instance state changes.  If it becomes
+    # yellowCard we trigger an immediate health check instead of waiting up to 60s.
+    if type_webhook == "instanceData":
+        state = payload.get("stateInstance", "")
+        logger.info(f"[instanceData] instance_id={instance_id} stateInstance={state}")
+        if state == "yellowCard":
+            logger.warning(f"[instanceData] yellowCard received for {instance_id} — triggering immediate health check")
+            from app.db.models import WhatsAppInstance
+            inst_res = await db.execute(
+                select(WhatsAppInstance).where(WhatsAppInstance.instance_id == instance_id)
+            )
+            inst = inst_res.scalar_one_or_none()
+            if inst:
+                from app.services.health_monitor import check_instance
+                import asyncio as _asyncio
+                _asyncio.create_task(check_instance(inst))
+        return
+
+    # ── everything else: only handle incomingMessageReceived ─────────────────
     if type_webhook != "incomingMessageReceived":
         logger.debug(f"Ignoring webhook type={type_webhook}")
         return
