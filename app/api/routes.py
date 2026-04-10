@@ -295,6 +295,12 @@ async def send_message_endpoint(
 
     logger.info(f"Incoming /api/send phone={req.phone} country={country_code} campaign={campaign_key} lang={lang}")
 
+    if country_code not in ("PT", "AR"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported country for outbound link pool: {country_code}",
+        )
+
     # 2. Blacklist check
     if await is_blacklisted(db, req.phone):
         return {"status": "blacklisted"}
@@ -475,6 +481,10 @@ async def bulk_send_endpoint(
         lang = country_info["lang"]
         promo = country_info["promo"]
         lead_id = lead.lead_id or lead.phone
+
+        if country_code not in ("PT", "AR"):
+            results.append({"phone": lead.phone, "status": "error", "detail": f"unsupported country: {country_code}"})
+            continue
 
         link_url = await claim_link(db, country_code, lead_id)
         if link_url is None:

@@ -37,10 +37,22 @@ from app.services.rate_limiter import calc_typing_time
 
 TOKEN = "8734698086:AAFHYFLDzgbU6_-nNiJX_cg6b5-32QxHDSo"
 
-# Test values — sent as dynamic variables
-TEST_LINK  = "https://vivajack.com/bonus?ref=TEST123"
-TEST_PROMO = "BONUS50"
-TEST_LANG  = "pt-PT"
+# Test values — sent as dynamic variables (separate from production link pool)
+TEST_LANG = os.getenv("TEST_LANG", "pt-PT")
+TEST_PROMO = os.getenv("TEST_PROMO", "BONUS50")
+TEST_LINK_PT = os.getenv("TEST_LINK_PT", "https://oro-casino.example/bonus?ref=TEST_PT")
+TEST_LINK_ES = os.getenv("TEST_LINK_ES", "https://pampas-casino.example/bonus?ref=TEST_AR")
+
+
+def _test_link_for_lang(lang: str) -> str:
+    return TEST_LINK_ES if lang == "es-AR" else TEST_LINK_PT
+
+
+def _languages_for_run() -> list[str]:
+    # Keep configured language first, always include the second one for cross-language testing.
+    primary = TEST_LANG if TEST_LANG in ("pt-PT", "es-AR") else "pt-PT"
+    secondary = "es-AR" if primary == "pt-PT" else "pt-PT"
+    return [primary, secondary]
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +81,7 @@ async def _fetch_template() -> str:
         agent_id=settings.AGENT_ID,
         chat_key="telegram-tester",
         language=TEST_LANG,
-        link_url=TEST_LINK,
+        link_url=_test_link_for_lang(TEST_LANG),
         promo_code=TEST_PROMO,
     )
 
@@ -125,7 +137,7 @@ async def cmd_raw(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         f"📄 *Raw генерація ElevenLabs:*\n\n`{template}`\n\n"
-        f"_lang={TEST_LANG} link={TEST_LINK} promo={TEST_PROMO}_",
+        f"_lang={TEST_LANG} link={_test_link_for_lang(TEST_LANG)} promo={TEST_PROMO}_",
         parse_mode="Markdown",
     )
 
@@ -139,26 +151,28 @@ async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(f"⏳ Генерую через ElevenLabs WS ×{n}…")
 
-    variants = []
-    for i in range(n):
-        v = await generate_outreach_message(
-            agent_id=settings.AGENT_ID,
-            chat_key=f"telegram-tester-{i}",
-            language=TEST_LANG,
-            link_url=TEST_LINK,
-            promo_code=TEST_PROMO,
-        )
-        variants.append(v if v else "(ElevenLabs повернув пустий рядок)")
+    lines = []
+    for lang in _languages_for_run():
+        variants = []
+        for i in range(n):
+            v = await generate_outreach_message(
+                agent_id=settings.AGENT_ID,
+                chat_key=f"telegram-tester-{lang}-{i}",
+                language=lang,
+                link_url=_test_link_for_lang(lang),
+                promo_code=TEST_PROMO,
+            )
+            variants.append(v if v else "(ElevenLabs повернув пустий рядок)")
 
-    lines = [f"🤖 *ELEVENLABS GEN ×{n} (lang={TEST_LANG})*\n"]
-    for i, v in enumerate(variants, 1):
-        display = v.replace("\u200b", "[·]").replace("\u200c", "[·]")
-        lines.append(f"*{i}.* {display}\n")
+        lines.append(f"🤖 *ELEVENLABS GEN ×{n} (lang={lang})*")
+        for i, v in enumerate(variants, 1):
+            display = v.replace("\u200b", "[·]").replace("\u200c", "[·]")
+            lines.append(f"*{i}.* {display}")
+        lines.append(_uniqueness_bar(variants))
 
-    lines.append(_uniqueness_bar(variants))
-
-    zw = sum(1 for v in variants if "\u200b" in v or "\u200c" in v or "\u200d" in v or "\ufeff" in v)
-    lines.append(f"🔡 Zero-width char: {zw}/{n} повідомлень")
+        zw = sum(1 for v in variants if "\u200b" in v or "\u200c" in v or "\u200d" in v or "\ufeff" in v)
+        lines.append(f"🔡 Zero-width char: {zw}/{n} повідомлень")
+        lines.append("")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -179,38 +193,43 @@ async def cmd_typing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("⏳ Повна перевірка…")
 
-    # 1. ElevenLabs generation ×5
-    variants = []
-    for i in range(5):
-        v = await generate_outreach_message(
-            agent_id=settings.AGENT_ID,
-            chat_key=f"telegram-full-{i}",
-            language=TEST_LANG,
-            link_url=TEST_LINK,
-            promo_code=TEST_PROMO,
-        )
-        variants.append(v if v else "(ElevenLabs повернув пустий рядок)")
+    # 1. ElevenLabs generation ×5 for both languages
+    gen_sections = []
+    for lang in _languages_for_run():
+        variants = []
+        for i in range(5):
+            v = await generate_outreach_message(
+                agent_id=settings.AGENT_ID,
+                chat_key=f"telegram-full-{lang}-{i}",
+                language=lang,
+                link_url=_test_link_for_lang(lang),
+                promo_code=TEST_PROMO,
+            )
+            variants.append(v if v else "(ElevenLabs повернув пустий рядок)")
 
-    if any(v and "пустий рядок" not in v for v in variants):
-        zw        = sum(1 for v in variants if "\u200b" in v or "\u200c" in v or "\u200d" in v or "\ufeff" in v)
+        if any(v and "пустий рядок" not in v for v in variants):
+            zw = sum(1 for v in variants if "\u200b" in v or "\u200c" in v or "\u200d" in v or "\ufeff" in v)
+            gen_unique = _uniqueness_bar(variants)
+            gen_status = "✅"
+        else:
+            zw = 0
+            gen_unique = "—"
+            gen_status = "❌"
+
         gen_block = "\n".join(f"  {i+1}. {v}" for i, v in enumerate(variants))
-        gen_unique = _uniqueness_bar(variants)
-        gen_status = "✅"
-    else:
-        gen_block  = "\n".join(f"  {i+1}. {v}" for i, v in enumerate(variants))
-        gen_unique = "—"
-        zw         = 0
-        gen_status = "❌"
+        gen_sections.append(
+            f"{gen_status} *ELEVENLABS GEN ×5 (lang={lang})*\n"
+            f"{gen_block}\n\n"
+            f"{gen_unique}\n"
+            f"🔡 Zero-width: {zw}/5"
+        )
 
     # 2. Typing ×30
     typing_block = _typing_report(30)
 
     report = (
         f"{'='*30}\n"
-        f"{gen_status} *ELEVENLABS GEN ×5*\n"
-        f"{gen_block}\n\n"
-        f"{gen_unique}\n"
-        f"🔡 Zero-width: {zw}/5\n\n"
+        f"{chr(10).join(gen_sections)}\n\n"
         f"{'='*30}\n"
         f"⏱ *TYPING TIME ×30*\n"
         f"{typing_block}"
@@ -226,7 +245,7 @@ async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     print(f"Agent ID   : {settings.AGENT_ID or '⚠ NOT SET'}")
     print(f"EL API Key : {'✓ set' if settings.ELEVENLABS_API_KEY else '⚠ NOT SET'}")
-    print(f"Test link  : {TEST_LINK}")
+    print(f"Test link  : {_test_link_for_lang(TEST_LANG)}")
     print(f"Test promo : {TEST_PROMO}")
     print(f"Test lang  : {TEST_LANG}")
     print("Bot is running. Press Ctrl+C to stop.")

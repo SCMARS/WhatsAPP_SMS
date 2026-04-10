@@ -13,7 +13,9 @@ import asyncio
 import json
 import logging
 import random
+import re
 import ssl
+import time
 from typing import Optional
 
 import certifi
@@ -56,6 +58,23 @@ def _normalize_dynamic_variables(dynamic_variables: Optional[dict[str, str]]) ->
     if not dynamic_variables:
         return {}
     return {str(k): str(v) for k, v in dynamic_variables.items() if v is not None}
+
+
+def _fallback_outreach(language: str, link_url: str, promo_code: Optional[str]) -> str:
+    promo = promo_code or "BONUS50"
+    if language == "es-AR":
+        return (
+            "Hola! Soy Olivia de Pampas Casino. "
+            "Tenes un bono del 175% en tu proximo deposito desde ARS 5000 (valido 5 dias). "
+            f"Responde a este mensaje para activar el link: {link_url}. "
+            "Mucha suerte!"
+        )
+    return (
+        "Ola! Sou a Camila do Oro Casino. "
+        f"Tens 50 Rodadas Gratis com o codigo {promo}. "
+        f"Responde a esta mensagem para ativar o link: {link_url}. "
+        "Boa sorte!"
+    )
 
 
 async def _open_socket(
@@ -444,13 +463,6 @@ async def generate_outreach_message(
     Generate initial outbound message via ElevenLabs ConvAI WebSocket.
     Uses dynamic variables consumed by the agent prompt: {language}, {link}, {promo}.
     """
-    dynamic_variables = {
-        "language": language,
-        "link": link_url,
-        "promo": promo_code or "",
-        "variant_id": f"v{random.randint(1000, 9999)}",
-    }
-
     session = _get_session(f"outreach:{chat_key}")
 
     # Warm-up turn: many agents send default "first message" greeting on a fresh WS session.
@@ -468,39 +480,72 @@ async def generate_outreach_message(
         # If warm-up fails, still attempt the real generation turn.
         pass
 
-    style_hint = random.choice([
-        "start with greeting then offer",
-        "start with offer then greeting",
-        "start with activation instruction then greeting",
-    ])
-    instruction = (
-        "Generate ONE WhatsApp outreach message now. "
-        "Use variables language={language}, link={link}, promo={promo}. "
-        f"Style hint: {style_hint}. "
-        f"Variant id: {dynamic_variables['variant_id']}. "
-        "Do not reuse your previous opening phrase. "
-        "Return only the final message text, no labels."
-    )
-    reply = await session.ask(
-        agent_id=agent_id,
-        context_text=WHATSAPP_CONTEXT,
-        prior_turns=[],
-        last_user_text=instruction,
-        language=None,
-        dynamic_variables=dynamic_variables,
-    )
-    result = (reply or "").strip()
-    if not result:
-        return ""
+    def _normalize_result(text: str) -> str:
+        result = (text or "").strip()
+        if not result:
+            return ""
+        # Safety net: if the model outputs literal placeholders, replace them locally.
+        result = result.replace("{{link}}", link_url or "")
+        result = result.replace("{{promo}}", promo_code or "")
+        result = result.replace("{{language}}", language or "")
+        result = result.replace("{link}", link_url or "")
+        result = result.replace("{promo}", promo_code or "")
+        result = result.replace("{language}", language or "")
+        return result.strip()
 
-    # Safety net: if the model outputs literal placeholders, replace them locally.
-    result = result.replace("{{link}}", link_url or "")
-    result = result.replace("{{promo}}", promo_code or "")
-    result = result.replace("{{language}}", language or "")
-    result = result.replace("{link}", link_url or "")
-    result = result.replace("{promo}", promo_code or "")
-    result = result.replace("{language}", language or "")
-    return result.strip()
+    def _passes_language_guard(text: str) -> bool:
+        lower = text.lower()
+        if language == "pt-PT":
+            banned = ("ars", "vos", "pampas", "olivia", "¿", "¡", "oro casino argentina")
+            required_any = ("olá", "contigo", "teu", "rodadas grátis", "boa sorte")
+            return (not any(token in lower for token in banned)) and any(t in lower for t in required_any)
+        if language == "es-AR":
+            banned = ("oro casino", "camila", "teu", "contigo", "rodadas grátis")
+            required_any = ("hola", "vos", "pampas", "suerte", "bono")
+            return (not any(token in lower for token in banned)) and any(t in lower for t in required_any)
+        return True
+
+    best = ""
+    for attempt in range(1, 5):
+        dynamic_variables = {
+            "language": language,
+            "link": link_url,
+            "promo": promo_code or "",
+            "variant_id": f"v{random.randint(1000, 9999)}",
+            "anti_spam_seed": f"{int(time.time() * 1000)}-{random.randint(10000, 99999)}",
+        }
+        style_hint = random.choice([
+            "start with greeting then offer",
+            "start with offer then greeting",
+            "start with activation instruction then greeting",
+            "start with short emoji greeting then offer details",
+        ])
+        instruction = (
+            "Generate ONE WhatsApp outreach message now. "
+            "Use variables language={language}, link={link}, promo={promo}. "
+            f"Style hint: {style_hint}. "
+            f"Variant id: {dynamic_variables['variant_id']}. "
+            "Do not reuse your previous opening phrase. "
+            "Return only the final message text, no labels."
+        )
+        reply = await session.ask(
+            agent_id=agent_id,
+            context_text=WHATSAPP_CONTEXT,
+            prior_turns=[],
+            last_user_text=instruction,
+            language=None,
+            dynamic_variables=dynamic_variables,
+        )
+        result = _normalize_result(reply)
+        if not result:
+            continue
+        best = result
+        if _passes_language_guard(result):
+            return result
+        logger.warning("Outreach rejected by language/casino guard, regenerating")
+
+    # Hard fallback if the model keeps violating language/casino constraints.
+    return _fallback_outreach(language=language, link_url=link_url, promo_code=promo_code)
 
 
 async def _download_audio(

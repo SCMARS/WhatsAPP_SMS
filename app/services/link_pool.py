@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import LinkPool
 
 logger = logging.getLogger(__name__)
+ALLOWED_POOL_COUNTRIES = {"PT", "AR"}
 
 
 async def claim_link(db: AsyncSession, country: str, lead_id: str) -> Optional[str]:
@@ -61,6 +62,10 @@ async def load_links(db: AsyncSession, links: list[dict]) -> dict:
         url = (item.get("url") or "").strip()
         country = (item.get("country") or "").strip().upper()
         if not url or not country:
+            skipped += 1
+            continue
+        if country not in ALLOWED_POOL_COUNTRIES:
+            logger.warning(f"Skipping link with unsupported country={country}: {url}")
             skipped += 1
             continue
 

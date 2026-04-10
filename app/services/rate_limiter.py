@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import secrets
 from typing import Optional
 
 from app.db.models import WhatsAppInstance
@@ -8,12 +9,21 @@ from app.db.models import WhatsAppInstance
 logger = logging.getLogger(__name__)
 
 def insert_zero_width(text: str) -> str:
-    """Insert one zero-width char at random position for hash uniqueness."""
+    """Insert invisible per-message fingerprint for transport-level uniqueness."""
     if not text:
         return text
-    insert_at = random.randint(0, len(text))
-    zw = random.choice(["\u200b", "\u200c", "\u200d", "\ufeff"])
-    return text[:insert_at] + zw + text[insert_at:]
+    # Encode a random 12-bit fingerprint as a 3-char invisible sequence.
+    # This keeps content human-identical while making transport payload unique.
+    alphabet = ["\u200b", "\u200c", "\u200d", "\ufeff"]
+    value = secrets.randbelow(4096)  # 12 bits
+    chars = []
+    for _ in range(3):
+        chars.append(alphabet[value & 0b11])
+        value >>= 2
+    marker = "".join(chars)
+
+    insert_at = random.randint(max(0, len(text) // 5), max(0, (len(text) * 4) // 5))
+    return text[:insert_at] + marker + text[insert_at:]
 
 
 def spin_text(template: str, contact: dict = {}) -> str:
