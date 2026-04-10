@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import random
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -10,13 +11,14 @@ from sqlalchemy import Integer, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.db.models import Campaign, Conversation, WhatsAppInstance
+from app.db.models import Campaign, Conversation, WhatsAppInstance, WhatsAppMessage
 from app.db.session import AsyncSessionLocal, get_db
-from app.services.elevenlabs import generate_text_reply, get_agent_prompt
+from app.services.elevenlabs import generate_outreach_message
 from app.services import pool as instance_pool
 from app.services.blacklist import is_blacklisted
 from app.services.country import detect_country
 from app.services.link_pool import claim_link, load_links
+from app.services.rate_limiter import batch_pause
 from app.services.sender import send_initial_message
 from app.webhook.handler import handle_incoming
 
@@ -24,36 +26,126 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+def _to_elevenlabs_language(lang: Optional[str]) -> str:
+    if lang == "es":
+        return "es-AR"
+    if lang == "pt":
+        return "pt-PT"
+    return "pt-PT"
+
+
+def _split_outreach_into_three_random_parts(text: str) -> list[str]:
+    """
+    Split outreach text into 3 non-empty parts and shuffle them.
+    This creates natural variation in message order.
+    """
+    cleaned = " ".join((text or "").split()).strip()
+    if not cleaned:
+        return []
+
+    # Prefer sentence-like chunks first.
+    sentence_parts = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+", cleaned)
+        if part.strip()
+    ]
+
+    parts: list[str]
+    if len(sentence_parts) >= 3:
+        parts = sentence_parts[:3]
+        if len(sentence_parts) > 3:
+            parts[-1] = f"{parts[-1]} {' '.join(sentence_parts[3:])}".strip()
+    else:
+        # Fallback: split by words into near-equal thirds.
+        words = cleaned.split()
+        total = len(words)
+        a = max(1, total // 3)
+        b = max(a + 1, (2 * total) // 3)
+        parts = [
+            " ".join(words[:a]).strip(),
+            " ".join(words[a:b]).strip(),
+            " ".join(words[b:]).strip(),
+        ]
+        # Repair any empty part for very short texts.
+        parts = [p for p in parts if p]
+        while len(parts) < 3:
+            parts.append(cleaned)
+        parts = parts[:3]
+
+    random.shuffle(parts)
+    return parts
+
+
+def _opening_key(text: str, words: int = 6) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip().lower())
+    cleaned = re.sub(r"[^\w\s]", "", cleaned)
+    tokenized = [t for t in cleaned.split(" ") if t]
+    return " ".join(tokenized[:words])
+
+
+async def _recent_opening_keys(db: AsyncSession, phone: str, limit: int = 12) -> set[str]:
+    rows = await db.execute(
+        select(WhatsAppMessage.body)
+        .join(Conversation, Conversation.id == WhatsAppMessage.conversation_id)
+        .where(
+            Conversation.phone == phone,
+            WhatsAppMessage.direction == "outbound",
+            WhatsAppMessage.body.isnot(None),
+        )
+        .order_by(WhatsAppMessage.created_at.desc())
+        .limit(limit)
+    )
+    bodies = [b for b in rows.scalars().all() if b]
+    return {_opening_key(b) for b in bodies if _opening_key(b)}
+
+
 async def _resolve_initial_message(
+    db: AsyncSession,
     campaign: Campaign,
-    lead_name: Optional[str],
+    lead_name: Optional[str],  # reserved, not injected into message
     phone: str,
     provided: Optional[str],
     language: Optional[str] = None,
     link_url: Optional[str] = None,
     promo_code: Optional[str] = None,
 ) -> list[str]:
-    import phonenumbers
-    
-    country = "PT"
-    try:
-        parsed = phonenumbers.parse(f"+{phone.lstrip('+')}")
-        country = phonenumbers.region_code_for_number(parsed)
-    except Exception:
-        pass
+    # Caller-supplied message takes priority (manual override).
+    if provided:
+        return [provided] if isinstance(provided, str) else list(provided)
 
-    if country == "AR" or language == "es":
-        # Argentina / Pampas script
-        msg1 = f"¡Hola! Acá Olivia de Pampas 🙂 Fue un placer charlar con vos."
-        msg2 = f"Como te prometí, acá tenés el link para tu bono del 175% en tu próximo dep. desde ARS 5000 · Solo por 5 días 👉 {link_url}"
-        msg3 = "El link se va a habilitar para hacer clic si respondés con cualquier mensaje en este chat (¡hasta un emoji sirve!) :) Muchos éxitos 🤞😉"
-    else:
-        # Default European Portuguese / Oro Casino script
-        msg1 = f"Olá! Aqui é a Camila do Oro Casino 🙂 Foi um prazer falar contigo."
-        msg2 = f"Como prometido, aqui está o teu código promocional: 50Pragmatic. 50 Rodadas Grátis na Pragmatic Play · Apenas por 5 dias 👉 {link_url}"
-        msg3 = "O link ficará clicável se me enviares qualquer mensagem de volta neste chat (nem que seja um emoji) :) Boa sorte 🤞😉"
+    resolved_lang = _to_elevenlabs_language(language)
+    recent_openings = await _recent_opening_keys(db, phone, limit=12)
 
-    return [msg1, msg2, msg3]
+    message = ""
+    max_attempts = 4
+    for attempt in range(1, max_attempts + 1):
+        candidate = await generate_outreach_message(
+            agent_id=campaign.agent_id,
+            chat_key=f"{phone}:outreach:{attempt}",
+            language=resolved_lang,
+            link_url=link_url or "",
+            promo_code=promo_code or "",
+        )
+        if not candidate:
+            continue
+        if _opening_key(candidate) not in recent_openings:
+            message = candidate
+            break
+        # Keep last candidate as fallback if all attempts collide.
+        message = candidate
+
+    if not message:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "ElevenLabs returned empty outreach text. Check your agent prompt and make sure "
+                "it handles dynamic variables {language}, {link}, {promo} and generates text."
+            ),
+        )
+
+    parts = _split_outreach_into_three_random_parts(message)
+    return parts or [message]
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +348,7 @@ async def send_message_endpoint(
 
     # 6. Build initial message
     initial_text = await _resolve_initial_message(
+        db=db,
         campaign=campaign,
         lead_name=req.lead_name,
         phone=req.phone,
@@ -329,7 +422,11 @@ async def bulk_send_endpoint(
     Returns per-lead results.
     """
     results = []
-    for lead in req.leads:
+    for i, lead in enumerate(req.leads):
+        # Fire batch pause BEFORE starting each new batch of 10 (not after)
+        if i > 0 and i % 10 == 0:
+            await batch_pause(i)
+
         # Override campaign_external_id from parent request if not set per-lead
         if not lead.campaign_external_id:
             lead.campaign_external_id = req.campaign_external_id
@@ -387,6 +484,7 @@ async def bulk_send_endpoint(
         # Determine initial message via ElevenLabs (returns list[str])
         try:
             initial_text = await _resolve_initial_message(
+                db=db,
                 campaign=campaign,
                 lead_name=lead.lead_name,
                 phone=lead.phone,
@@ -408,7 +506,7 @@ async def bulk_send_endpoint(
             db=db,
             conversation=conversation,
             initial_text=initial_text,
-            batch_index=lead.batch_index,
+            batch_index=i,
         )
 
         if msg is None:

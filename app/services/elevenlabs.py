@@ -12,6 +12,7 @@ Conversation continuity:
 import asyncio
 import json
 import logging
+import random
 import ssl
 from typing import Optional
 
@@ -51,7 +52,17 @@ async def _get_signed_url(agent_id: str) -> str:
         return resp.json()["signed_url"]
 
 
-async def _open_socket(agent_id: str, language: Optional[str] = None) -> websockets.WebSocketClientProtocol:
+def _normalize_dynamic_variables(dynamic_variables: Optional[dict[str, str]]) -> dict[str, str]:
+    if not dynamic_variables:
+        return {}
+    return {str(k): str(v) for k, v in dynamic_variables.items() if v is not None}
+
+
+async def _open_socket(
+    agent_id: str,
+    language: Optional[str] = None,
+    dynamic_variables: Optional[dict[str, str]] = None,
+) -> websockets.WebSocketClientProtocol:
     """Open a fresh ElevenLabs ConvAI WebSocket and complete the handshake."""
     signed_url = await _get_signed_url(agent_id)
     ws = await websockets.connect(
@@ -70,15 +81,18 @@ async def _open_socket(agent_id: str, language: Optional[str] = None) -> websock
             logger.debug("ElevenLabs WS: got initiation metadata")
             break
 
-    # 2. Enable text-only mode + optional language override
+    # 2. Enable text-only mode
     config_override: dict = {"conversation": {"text_only": True}}
-    if language:
-        config_override["agent"] = {"language": language}
 
-    await ws.send(json.dumps({
+    payload = {
         "type": "conversation_initiation_client_data",
         "conversation_config_override": config_override,
-    }))
+    }
+    normalized_vars = _normalize_dynamic_variables(dynamic_variables)
+    if normalized_vars:
+        payload["dynamic_variables"] = normalized_vars
+
+    await ws.send(json.dumps(payload))
 
     return ws
 
@@ -106,15 +120,26 @@ class _ChatSession:
         self.lock = asyncio.Lock()
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._language: Optional[str] = None
+        self._dynamic_vars: dict[str, str] = {}
 
     async def _ensure_connected(
-        self, agent_id: str, language: Optional[str] = None
+        self,
+        agent_id: str,
+        language: Optional[str] = None,
+        dynamic_variables: Optional[dict[str, str]] = None,
     ) -> websockets.WebSocketClientProtocol:
+        normalized_vars = _normalize_dynamic_variables(dynamic_variables)
         # If language changed, force reconnect to use new config
-        if _is_socket_alive(self.ws) and self._language == language:
+        if (
+            _is_socket_alive(self.ws)
+            and self._language == language
+            and self._dynamic_vars == normalized_vars
+        ):
             return self.ws
-        if _is_socket_alive(self.ws) and self._language != language:
-            logger.info(f"Language changed {self._language}→{language}, reconnecting WS")
+        if _is_socket_alive(self.ws) and (
+            self._language != language or self._dynamic_vars != normalized_vars
+        ):
+            logger.info("WS config changed, reconnecting (language and/or dynamic vars)")
             try:
                 await self.ws.close()
             except Exception:
@@ -127,9 +152,14 @@ class _ChatSession:
             except Exception:
                 pass
 
-        logger.info(f"Opening new ElevenLabs WS (agent={agent_id}, lang={language})")
-        self.ws = await _open_socket(agent_id, language=language)
+        logger.info(f"Opening new ElevenLabs WS (agent={agent_id})")
+        self.ws = await _open_socket(
+            agent_id,
+            language=language,
+            dynamic_variables=normalized_vars,
+        )
         self._language = language
+        self._dynamic_vars = normalized_vars
         return self.ws
 
     async def ask(
@@ -139,11 +169,16 @@ class _ChatSession:
         prior_turns: list[dict],
         last_user_text: str,
         language: Optional[str] = None,
+        dynamic_variables: Optional[dict[str, str]] = None,
     ) -> str:
         async with self.lock:
             reply = ""
 
-            ws = await self._ensure_connected(agent_id, language=language)
+            ws = await self._ensure_connected(
+                agent_id,
+                language=language,
+                dynamic_variables=dynamic_variables,
+            )
 
             # --- DRAIN BUFFER ---
             # Anything sitting in the buffer now (like an automated ElevenLabs greeting)
@@ -219,7 +254,11 @@ class _ChatSession:
             except (ConnectionClosed, ConnectionError, OSError) as e:
                 logger.warning(f"ElevenLabs WS closed mid-turn ({e}), reconnecting…")
                 self.ws = None
-                ws = await self._ensure_connected(agent_id, language=language)
+                ws = await self._ensure_connected(
+                    agent_id,
+                    language=language,
+                    dynamic_variables=dynamic_variables,
+                )
                 reply = ""
                 await _run_turn(ws)
             except asyncio.TimeoutError:
@@ -236,6 +275,7 @@ class _ChatSession:
                 except Exception:
                     pass
             self.ws = None
+            self._dynamic_vars = {}
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +304,7 @@ async def generate_text_reply(
     lead_name: Optional[str] = None,
     chat_key: Optional[str] = None,
     language: Optional[str] = None,
+    dynamic_variables: Optional[dict[str, str]] = None,
 ) -> str:
     """
     Generate a text reply via ElevenLabs ConvAI WebSocket (text-only mode).
@@ -295,6 +336,7 @@ async def generate_text_reply(
             prior_turns=prior_turns,
             last_user_text=last_user_text,
             language=language,
+            dynamic_variables=dynamic_variables,
         )
     except asyncio.TimeoutError:
         logger.warning("ElevenLabs WebSocket timeout after 45s")
@@ -311,6 +353,7 @@ async def generate_text_reply(
                     prior_turns=prior_turns,
                     last_user_text=last_user_text,
                     language=language,
+                    dynamic_variables=dynamic_variables,
                 )
             except asyncio.TimeoutError:
                 logger.warning("ElevenLabs retry timed out")
@@ -347,6 +390,117 @@ async def get_agent_prompt(agent_id: str) -> dict:
         first_message = ""
 
     return {"prompt": prompt, "first_message": first_message}
+
+
+async def get_outreach_message(
+    agent_id: str,
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> str:
+    """
+    Fetch the agent's first_message from ElevenLabs (REST, no WebSocket) and
+    substitute link/promo placeholders.
+
+    Configure your ElevenLabs agent's "First message" field with placeholders:
+        {link}   → replaced with the affiliate link
+        {promo}  → replaced with the promo code
+
+    Example first_message in ElevenLabs dashboard:
+        "Привет! Это Анна из Vivajack 🙂 Вот твоя персональная ссылка:
+         {link}  Промокод: {promo}. Ответь на это сообщение чтобы активировать!"
+
+    Returns the final message string, or empty string if first_message not set.
+    """
+    config = await get_agent_prompt(agent_id)
+    template = config.get("first_message", "").strip()
+
+    if not template or template.lower() in ("hey", "hello", "hi", ""):
+        logger.warning(
+            "ElevenLabs first_message is empty or default ('%s'). "
+            "Set it in the ElevenLabs dashboard → Agent → First message.",
+            template,
+        )
+        return ""
+
+    # Substitute placeholders — support both {link}/{promo} and {{link}}/{{promo}}
+    result = template
+    result = result.replace("{{link}}",  link_url   or "")
+    result = result.replace("{{promo}}", promo_code or "")
+    result = result.replace("{link}",    link_url   or "")
+    result = result.replace("{promo}",   promo_code or "")
+
+    logger.info("ElevenLabs outreach message fetched (%d chars)", len(result))
+    return result
+
+
+async def generate_outreach_message(
+    agent_id: str,
+    chat_key: str,
+    language: str,
+    link_url: str,
+    promo_code: Optional[str] = None,
+) -> str:
+    """
+    Generate initial outbound message via ElevenLabs ConvAI WebSocket.
+    Uses dynamic variables consumed by the agent prompt: {language}, {link}, {promo}.
+    """
+    dynamic_variables = {
+        "language": language,
+        "link": link_url,
+        "promo": promo_code or "",
+        "variant_id": f"v{random.randint(1000, 9999)}",
+    }
+
+    session = _get_session(f"outreach:{chat_key}")
+
+    # Warm-up turn: many agents send default "first message" greeting on a fresh WS session.
+    # We consume it first, then request the actual outreach copy.
+    try:
+        await session.ask(
+            agent_id=agent_id,
+            context_text=WHATSAPP_CONTEXT,
+            prior_turns=[],
+            last_user_text="Hi",
+            language=None,
+            dynamic_variables=dynamic_variables,
+        )
+    except Exception:
+        # If warm-up fails, still attempt the real generation turn.
+        pass
+
+    style_hint = random.choice([
+        "start with greeting then offer",
+        "start with offer then greeting",
+        "start with activation instruction then greeting",
+    ])
+    instruction = (
+        "Generate ONE WhatsApp outreach message now. "
+        "Use variables language={language}, link={link}, promo={promo}. "
+        f"Style hint: {style_hint}. "
+        f"Variant id: {dynamic_variables['variant_id']}. "
+        "Do not reuse your previous opening phrase. "
+        "Return only the final message text, no labels."
+    )
+    reply = await session.ask(
+        agent_id=agent_id,
+        context_text=WHATSAPP_CONTEXT,
+        prior_turns=[],
+        last_user_text=instruction,
+        language=None,
+        dynamic_variables=dynamic_variables,
+    )
+    result = (reply or "").strip()
+    if not result:
+        return ""
+
+    # Safety net: if the model outputs literal placeholders, replace them locally.
+    result = result.replace("{{link}}", link_url or "")
+    result = result.replace("{{promo}}", promo_code or "")
+    result = result.replace("{{language}}", language or "")
+    result = result.replace("{link}", link_url or "")
+    result = result.replace("{promo}", promo_code or "")
+    result = result.replace("{language}", language or "")
+    return result.strip()
 
 
 async def _download_audio(

@@ -9,8 +9,13 @@ from app.db.models import Blacklist, Conversation
 logger = logging.getLogger(__name__)
 
 STOP_KEYWORDS = {
-    "stop", "стоп", "отписаться", "отписать", "не пишите", "не беспокоить",
-    "хватит", "unsubscribe", "quit", "cancel", "отмена", "удалите", "уберите",
+    # Ukrainian
+    "стоп", "відписатись", "відписати", "не писати", "досить",
+    # Russian
+    "стоп", "хватит", "отписаться", "отписать", "не пишите", "не беспокоить",
+    "отмена", "удалите", "уберите",
+    # English
+    "stop", "unsubscribe", "quit", "cancel",
 }
 
 

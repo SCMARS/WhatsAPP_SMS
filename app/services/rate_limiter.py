@@ -7,13 +7,23 @@ from app.db.models import WhatsAppInstance
 
 logger = logging.getLogger(__name__)
 
-GREETINGS = [
-    "Hi",
-    "Hey",
-    "Hello",
-    "Hi there",
-    "Hey there",
-]
+def insert_zero_width(text: str) -> str:
+    """Insert one zero-width char at random position for hash uniqueness."""
+    if not text:
+        return text
+    insert_at = random.randint(0, len(text))
+    zw = random.choice(["\u200b", "\u200c", "\u200d", "\ufeff"])
+    return text[:insert_at] + zw + text[insert_at:]
+
+
+def spin_text(template: str, contact: dict = {}) -> str:
+    """Backward-compatible alias; now only adds zero-width uniqueness."""
+    return insert_zero_width(template.strip())
+
+
+def add_footer(text: str) -> str:
+    """Append opt-out instructions to outbound broadcast messages."""
+    return text + "\n\n_Щоб відписатись — відповідайте 'Стоп'_"
 
 
 async def reply_pause(min_sec: float = 4.0, max_sec: float = 8.0) -> None:
@@ -47,9 +57,37 @@ async def batch_pause(batch_index: int, batch_size: int = 10, pause_sec: float =
         await asyncio.sleep(actual_pause)
 
 
+def calc_typing_time(message: str) -> int:
+    """
+    Estimate realistic typing time in milliseconds with stable target distribution:
+    - 10% fast  (<= 2100 ms)
+    - 80% normal (2101..5999 ms)
+    - 10% slow  (>= 6000 ms)
+    """
+    chars = len(message)
+    base_ms = int((chars / 3) * 1000)  # baseline around 3 chars/sec
+
+    r = random.random()
+    if r < 0.10:
+        # Fast bucket: always <= 2100
+        ms = int(base_ms * random.uniform(0.35, 0.6))
+        return max(1200, min(ms, 2100))
+    elif r < 0.20:
+        # Slow bucket: always >= 6000
+        ms = int(base_ms * random.uniform(1.8, 3.4))
+        return max(6000, min(ms, 12000))
+    else:
+        # Normal bucket: strictly between fast and slow thresholds
+        ms = int(base_ms * random.uniform(0.8, 1.25))
+        return max(2101, min(ms, 5999))
+
+
+# ---------------------------------------------------------------------------
+# Legacy helper kept for any external callers that haven't migrated to spin_text
+# ---------------------------------------------------------------------------
+
 def personalize_message(template: str, lead_name: Optional[str] = None) -> str:
-    greeting = random.choice(GREETINGS)
-    message = template.replace("{{greeting}}", greeting)
+    message = template.replace("{{greeting}}", "Hi")
     if lead_name:
         message = message.replace("{{name}}", lead_name)
     else:

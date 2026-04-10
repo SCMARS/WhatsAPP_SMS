@@ -197,6 +197,22 @@ async def _handle_incoming_locked(
     if is_stop_message(text):
         await add_to_blacklist(db, phone, reason="STOP request")
         logger.info(f"Phone {phone} sent STOP, added to blacklist")
+        # Send one-time unsubscribe confirmation (conversation may already be closed)
+        conf_res = await db.execute(
+            select(Conversation)
+            .where(Conversation.phone.in_(list(phone_variants)))
+            .order_by(Conversation.created_at.desc())
+            .limit(1)
+        )
+        conf_conv = conf_res.scalar_one_or_none()
+        if conf_conv:
+            await send_message(
+                db=db,
+                conversation=conf_conv,
+                text="Вас успішно відписано від розсилки. Більше ми вам не пишемо.",
+                batch_index=0,
+                is_reply=True,
+            )
         return
 
     # 6. Find most recent active Conversation by phone
