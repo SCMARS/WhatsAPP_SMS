@@ -10,6 +10,7 @@ from app.config import settings
 from app.db.session import init_db
 from app.api.routes import router
 from app.services.ignore_followup import run_ignore_followup_worker
+from app.services.health_monitor import run_health_monitor
 
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -25,13 +26,15 @@ async def lifespan(app: FastAPI):
     logger.info("Database initialized")
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(run_ignore_followup_worker(stop_event))
+    health_task = asyncio.create_task(run_health_monitor(stop_event))
     yield
     stop_event.set()
-    worker_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
+    for task in (worker_task, health_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     logger.info("Shutting down WR WhatsApp Service")
 
 

@@ -467,6 +467,7 @@ async def generate_outreach_message(
 
     # Warm-up turn: many agents send default "first message" greeting on a fresh WS session.
     # We consume it first, then request the actual outreach copy.
+    # (No dynamic variables on warmup — we just discard the greeting.)
     try:
         await session.ask(
             agent_id=agent_id,
@@ -474,7 +475,7 @@ async def generate_outreach_message(
             prior_turns=[],
             last_user_text="Hi",
             language=None,
-            dynamic_variables=dynamic_variables,
+            dynamic_variables=None,  # Warmup doesn't need variables
         )
     except Exception:
         # If warm-up fails, still attempt the real generation turn.

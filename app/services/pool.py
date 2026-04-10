@@ -47,6 +47,7 @@ async def get_best_instance(db: AsyncSession, is_reservation: bool = True) -> Op
             select(WhatsAppInstance).where(
                 WhatsAppInstance.is_active == True,
                 WhatsAppInstance.is_banned == False,
+                WhatsAppInstance.health_status.notin_(["blocked", "notAuthorized", "yellowCard"]),
             ).order_by(
                 WhatsAppInstance.last_send_at.asc().nulls_first(),
                 WhatsAppInstance.created_at.desc()

@@ -162,6 +162,9 @@ async def _do_send(
         resp = await client.post(url, json=payload)
 
     if resp.status_code in (403, 429):
+        # Trigger an immediate health check in the background so the monitor
+        # updates the instance state without waiting for the next 60-second cycle.
+        asyncio.create_task(_async_health_check(instance))
         raise RuntimeError(f"HTTP {resp.status_code} from Green API — likely banned/rate-limited")
 
     data = {}
@@ -190,6 +193,15 @@ async def _do_send(
     if provider_id:
         logger.info(f"Green API: message sent, provider_id={provider_id}")
     return provider_id, None, "sent"
+
+
+async def _async_health_check(instance: WhatsAppInstance) -> None:
+    """Fire-and-forget: check instance state immediately and update DB."""
+    try:
+        from app.services.health_monitor import check_instance
+        await check_instance(instance)
+    except Exception as e:
+        logger.warning(f"Immediate health check for {instance.instance_id} failed: {e}")
 
 
 async def send_initial_message(

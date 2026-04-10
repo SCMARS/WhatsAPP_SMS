@@ -14,6 +14,7 @@ from app.config import settings
 from app.db.models import Campaign, Conversation, WhatsAppInstance, WhatsAppMessage
 from app.db.session import AsyncSessionLocal, get_db
 from app.services.elevenlabs import generate_outreach_message
+from app.services.green_api import set_anti_ban_settings, get_state_instance
 from app.services import pool as instance_pool
 from app.services.blacklist import is_blacklisted
 from app.services.country import detect_country
@@ -697,11 +698,22 @@ async def create_instance(
     await db.commit()
     await db.refresh(instance)
 
+    # Apply anti-ban settings immediately after registration
+    state = await get_state_instance(req.instance_id, req.api_token)
+    anti_ban_ok = False
+    if state == "authorized":
+        anti_ban_ok = await set_anti_ban_settings(req.instance_id, req.api_token)
+    logger.info(
+        f"New instance {req.instance_id} registered: state={state} anti_ban_applied={anti_ban_ok}"
+    )
+
     return {
         "id": str(instance.id),
         "instance_id": instance.instance_id,
         "name": instance.name,
         "is_active": instance.is_active,
+        "state": state,
+        "anti_ban_applied": anti_ban_ok,
     }
 
 
