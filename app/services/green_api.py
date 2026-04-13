@@ -12,12 +12,18 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_BASE = "https://7107.api.greenapi.com"
+GREEN_API_BASE = "https://7107.api.greenapi.com"
+_BASE = GREEN_API_BASE  # keep for internal use
 _TIMEOUT = 15.0
 
 
 def _url(instance_id: str, api_token: str, method: str) -> str:
-    return f"{_BASE}/waInstance{instance_id}/{method}/{api_token}"
+    return f"{GREEN_API_BASE}/waInstance{instance_id}/{method}/{api_token}"
+
+
+def build_url(instance_id: str, api_token: str, method: str) -> str:
+    """Public helper — build a full Green API endpoint URL."""
+    return _url(instance_id, api_token, method)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +99,8 @@ async def set_anti_ban_settings(instance_id: str, api_token: str) -> bool:
         "delaySendMessagesMilliseconds": 15000,
         "markIncomingMessagesReaded": "yes",
         "markIncomingMessagesReadedOnReply": "yes",
+        "keepOnlineStatus": "yes",   # keep instance visible as "online" — looks human
+        "stateWebhook": "yes",       # real-time ban/yellowCard notifications via webhook
     }
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -111,6 +119,38 @@ async def set_anti_ban_settings(instance_id: str, api_token: str) -> bool:
     except Exception as e:
         logger.warning(f"set_anti_ban_settings({instance_id}) failed: {e}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# Phone number verification
+# ---------------------------------------------------------------------------
+
+async def check_whatsapp(instance_id: str, api_token: str, phone: str) -> bool:
+    """
+    Check whether a phone number is registered on WhatsApp.
+
+    `phone` should be digits only (e.g. "380671234567").
+    Returns True if the number has WhatsApp, False otherwise (or on error — fail-open
+    so a network blip doesn't block all sends).
+
+    NOTE: Green API warns against calling this too frequently.
+    Callers must cache results (see sender.py _whatsapp_cache).
+    """
+    try:
+        phone_int = int("".join(c for c in phone if c.isdigit()))
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                _url(instance_id, api_token, "checkWhatsapp"),
+                json={"phoneNumber": phone_int},
+            )
+        if resp.status_code == 200:
+            exists = resp.json().get("existsWhatsapp", True)
+            logger.debug(f"checkWhatsapp({phone}) → existsWhatsapp={exists}")
+            return bool(exists)
+    except Exception as e:
+        logger.warning(f"check_whatsapp({phone}) failed: {e}")
+    # Fail-open: if the check errors, allow the send to proceed
+    return True
 
 
 # ---------------------------------------------------------------------------

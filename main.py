@@ -3,8 +3,10 @@ import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
 from app.db.session import init_db
@@ -17,6 +19,32 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Auth middleware — guards all /api/* routes at the application level.
+# Routes that must stay public (health, webhooks) are explicitly excluded.
+# This acts as a safety net even if a new route is added without the
+# per-route `require_api_key` dependency.
+# ---------------------------------------------------------------------------
+
+_PUBLIC_PREFIXES = ("/health", "/webhook/", "/docs", "/openapi.json", "/redoc")
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        # Allow public paths through without auth
+        if any(path.startswith(p) for p in _PUBLIC_PREFIXES):
+            return await call_next(request)
+
+        # All other paths require a valid API key
+        key = request.headers.get("x-api-key", "")
+        if key != settings.API_SECRET_KEY:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid or missing API key"},
+            )
+        return await call_next(request)
 
 
 @asynccontextmanager
@@ -43,6 +71,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(ApiKeyMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

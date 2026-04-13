@@ -73,8 +73,13 @@ async def handle_incoming(
             inst = inst_res.scalar_one_or_none()
             if inst:
                 from app.services.health_monitor import check_instance
-                import asyncio as _asyncio
-                _asyncio.create_task(check_instance(inst))
+
+                def _log_exc(t: asyncio.Task) -> None:
+                    if not t.cancelled() and t.exception():
+                        logger.error(f"Immediate health check task failed: {t.exception()}")
+
+                task = asyncio.create_task(check_instance(inst))
+                task.add_done_callback(_log_exc)
         return
 
     # ── everything else: only handle incomingMessageReceived ─────────────────

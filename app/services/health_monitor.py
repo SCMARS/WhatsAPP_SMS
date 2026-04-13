@@ -23,11 +23,20 @@ from app.db.session import AsyncSessionLocal
 from app.services.green_api import (
     clear_messages_queue,
     get_state_instance,
+    get_status_instance,
     reboot_instance,
     set_anti_ban_settings,
     unban_instance,
 )
 from app.services import pool as instance_pool
+from app.services.reply_monitor import (
+    BLOCK_RATE_DANGER,
+    BLOCK_RATE_WARNING,
+    REPLY_RATE_DANGER,
+    REPLY_RATE_WARNING,
+    get_block_rate,
+    get_reply_rate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,65 @@ REBOOT_SETTLE_SEC = 15      # time to wait between reboot and queue clear
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _check_reply_rate(instance_id: str) -> None:
+    """
+    Log a warning / error when the reply rate drops below safe thresholds.
+    Called after every successful authorized+online health check.
+    Uses its own DB session (health_monitor already owns no session at call time).
+    """
+    async with AsyncSessionLocal() as db:
+        rate = await get_reply_rate(db, instance_id)
+
+    if rate is None:
+        logger.debug("[ReplyMonitor] %s — no data yet (new or idle instance)", instance_id)
+        return
+
+    if rate < REPLY_RATE_DANGER:
+        logger.error(
+            "[ReplyMonitor] ⛔ %s reply rate=%.1f%% — DANGER (< %.0f%%). "
+            "High ban risk! Pause sends and review lead quality.",
+            instance_id, rate * 100, REPLY_RATE_DANGER * 100,
+        )
+    elif rate < REPLY_RATE_WARNING:
+        logger.warning(
+            "[ReplyMonitor] ⚠ %s reply rate=%.1f%% — WARNING (< %.0f%%). "
+            "Monitor closely, reduce volume if trend continues.",
+            instance_id, rate * 100, REPLY_RATE_WARNING * 100,
+        )
+    else:
+        logger.info(
+            "[ReplyMonitor] ✓ %s reply rate=%.1f%% — OK",
+            instance_id, rate * 100,
+        )
+
+
+async def _check_block_rate(instance_id: str) -> None:
+    """Log warning/error when block rate rises above safe thresholds."""
+    async with AsyncSessionLocal() as db:
+        rate = await get_block_rate(db, instance_id)
+
+    if rate is None:
+        return
+
+    if rate > BLOCK_RATE_DANGER:
+        logger.error(
+            "[BlockMonitor] ⛔ %s block rate=%.2f%% — DANGER (> %.0f%%). "
+            "Users are blocking/reporting — high ban risk!",
+            instance_id, rate * 100, BLOCK_RATE_DANGER * 100,
+        )
+    elif rate > BLOCK_RATE_WARNING:
+        logger.warning(
+            "[BlockMonitor] ⚠ %s block rate=%.2f%% — WARNING (> %.0f%%). "
+            "Review lead quality and message content.",
+            instance_id, rate * 100, BLOCK_RATE_WARNING * 100,
+        )
+    else:
+        logger.info(
+            "[BlockMonitor] ✓ %s block rate=%.2f%% — OK",
+            instance_id, rate * 100,
+        )
+
 
 async def _update_health(instance_id: str, health_status: str, is_active: bool, is_banned: bool) -> None:
     async with AsyncSessionLocal() as db:
@@ -79,7 +147,22 @@ async def check_instance(inst: WhatsAppInstance) -> None:
     if state == "authorized":
         # Make sure anti-ban settings are in place every cycle
         await set_anti_ban_settings(instance_id, api_token)
-        await _update_health(instance_id, "authorized", is_active=True, is_banned=False)
+
+        # Also verify socket is open — instance can be "authorized" but disconnected
+        status_data = await get_status_instance(instance_id, api_token)
+        socket_status = status_data.get("statusInstance", "unknown")
+        if socket_status == "offline":
+            logger.warning(
+                f"[HealthMonitor] {instance_id} authorized but socket=offline — rebooting to restore connection"
+            )
+            await reboot_instance(instance_id, api_token)
+            await asyncio.sleep(REBOOT_SETTLE_SEC)
+            await _update_health(instance_id, "authorized", is_active=False, is_banned=False)
+        else:
+            await _update_health(instance_id, "authorized", is_active=True, is_banned=False)
+            # Check reply + block rate every cycle to catch ban-risk trends early
+            await _check_reply_rate(instance_id)
+            await _check_block_rate(instance_id)
 
     elif state == "yellowCard":
         logger.warning(
@@ -124,7 +207,7 @@ async def check_instance(inst: WhatsAppInstance) -> None:
 
     elif state == "sleepMode":
         logger.info(f"[HealthMonitor] {instance_id} in sleepMode — no action (will self-recover)")
-        await _update_health(instance_id, "sleepMode", is_active=True, is_banned=False)
+        await _update_health(instance_id, "sleepMode", is_active=False, is_banned=False)
 
     else:
         # unknown or unexpected — skip, will retry next cycle

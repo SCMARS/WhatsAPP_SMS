@@ -19,7 +19,7 @@ def insert_zero_width(text: str) -> str:
     return text[:insert_at] + "\u200b" + text[insert_at:]
 
 
-def spin_text(template: str, contact: dict = {}) -> str:
+def spin_text(template: str, contact: Optional[dict] = None) -> str:
     """Backward-compatible alias; now only adds zero-width uniqueness."""
     return insert_zero_width(template.strip())
 
@@ -62,27 +62,30 @@ async def batch_pause(batch_index: int, batch_size: int = 10, pause_sec: float =
 
 def calc_typing_time(message: str) -> int:
     """
-    Estimate realistic typing time in milliseconds with stable target distribution:
-    - 10% fast  (<= 2100 ms)
-    - 80% normal (2101..5999 ms)
-    - 10% slow  (>= 6000 ms)
+    Estimate realistic typing time in milliseconds.
+    - 10% fast   : 4 000 –  6 000 ms
+    - 80% normal : 6 000 – 15 000 ms
+    - 10% slow   :15 000 – 25 000 ms
+
+    Minimum is 4 000 ms even for very short messages so the typing indicator
+    is always visible to the recipient.
     """
     chars = len(message)
-    base_ms = int((chars / 3) * 1000)  # baseline around 3 chars/sec
+    base_ms = int((chars / 4) * 1000)  # ~4 chars/sec baseline
 
     r = random.random()
     if r < 0.10:
-        # Fast bucket: always <= 2100
-        ms = int(base_ms * random.uniform(0.35, 0.6))
-        return max(1200, min(ms, 2100))
+        # Fast bucket
+        ms = int(base_ms * random.uniform(0.6, 0.9))
+        return max(4000, min(ms, 6000))
     elif r < 0.20:
-        # Slow bucket: always >= 6000
-        ms = int(base_ms * random.uniform(1.8, 3.4))
-        return max(6000, min(ms, 12000))
+        # Slow bucket
+        ms = int(base_ms * random.uniform(1.8, 3.0))
+        return max(15000, min(ms, 25000))
     else:
-        # Normal bucket: strictly between fast and slow thresholds
-        ms = int(base_ms * random.uniform(0.8, 1.25))
-        return max(2101, min(ms, 5999))
+        # Normal bucket
+        ms = int(base_ms * random.uniform(0.9, 1.3))
+        return max(6000, min(ms, 15000))
 
 
 # ---------------------------------------------------------------------------

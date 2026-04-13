@@ -100,8 +100,11 @@ async def _open_socket(
             logger.debug("ElevenLabs WS: got initiation metadata")
             break
 
-    # 2. Enable text-only mode
+    # 2. Enable text-only mode + language override
     config_override: dict = {"conversation": {"text_only": True}}
+    if language:
+        # Tell ElevenLabs which language the agent should respond in
+        config_override["agent"] = {"language": language}
 
     payload = {
         "type": "conversation_initiation_client_data",
@@ -281,7 +284,8 @@ class _ChatSession:
                 reply = ""
                 await _run_turn(ws)
             except asyncio.TimeoutError:
-                logger.warning("ElevenLabs _collect timed out after 45s")
+                logger.warning("ElevenLabs _collect timed out after 45s — resetting socket")
+                self.ws = None  # Force reconnect on next turn; stale response must not leak through
                 raise
 
             return reply
@@ -495,55 +499,80 @@ async def generate_outreach_message(
         return result.strip()
 
     def _passes_language_guard(text: str) -> bool:
-        lower = text.lower()
+        import re as _re
+        # Strip URLs before checking — they can contain brand words (e.g. "pampas" in the link)
+        # that would give false-positive matches for the wrong language.
+        text_no_urls = _re.sub(r"https?://\S+", "", text)
+        lower = text_no_urls.lower()
+
         if language == "pt-PT":
             banned = ("ars", "vos", "pampas", "olivia", "¿", "¡", "oro casino argentina")
-            required_any = ("olá", "contigo", "teu", "rodadas grátis", "boa sorte")
-            return (not any(token in lower for token in banned)) and any(t in lower for t in required_any)
+            # Require at least 2 of these Portuguese indicators (not just 1)
+            required = ("olá", "contigo", "teu", "rodadas", "boa sorte", "grátis", "código")
+            hits = sum(1 for t in required if t in lower)
+            return (not any(token in lower for token in banned)) and hits >= 2
+
         if language == "es-AR":
-            banned = ("oro casino", "camila", "teu", "contigo", "rodadas grátis")
-            required_any = ("hola", "vos", "pampas", "suerte", "bono")
-            return (not any(token in lower for token in banned)) and any(t in lower for t in required_any)
+            banned = ("oro casino", "camila", "teu", "contigo", "rodadas grátis", "olá", "boa sorte")
+            # Require at least 2 Spanish indicators (without relying on brand name in URL)
+            required = ("hola", "vos", "suerte", "bono", "deposito", "activar", "ars")
+            hits = sum(1 for t in required if t in lower)
+            return (not any(token in lower for token in banned)) and hits >= 2
+
         return True
 
     best = ""
-    for attempt in range(1, 5):
-        dynamic_variables = {
-            "language": language,
-            "link": link_url,
-            "promo": promo_code or "",
-            "variant_id": f"v{random.randint(1000, 9999)}",
-            "anti_spam_seed": f"{int(time.time() * 1000)}-{random.randint(10000, 99999)}",
-        }
-        style_hint = random.choice([
-            "start with greeting then offer",
-            "start with offer then greeting",
-            "start with activation instruction then greeting",
-            "start with short emoji greeting then offer details",
-        ])
-        instruction = (
-            "Generate ONE WhatsApp outreach message now. "
-            "Use variables language={language}, link={link}, promo={promo}. "
-            f"Style hint: {style_hint}. "
-            f"Variant id: {dynamic_variables['variant_id']}. "
-            "Do not reuse your previous opening phrase. "
-            "Return only the final message text, no labels."
-        )
-        reply = await session.ask(
-            agent_id=agent_id,
-            context_text=WHATSAPP_CONTEXT,
-            prior_turns=[],
-            last_user_text=instruction,
-            language=None,
-            dynamic_variables=dynamic_variables,
-        )
-        result = _normalize_result(reply)
-        if not result:
-            continue
-        best = result
-        if _passes_language_guard(result):
-            return result
-        logger.warning("Outreach rejected by language/casino guard, regenerating")
+    try:
+        for attempt in range(1, 5):
+            dynamic_variables = {
+                "language": language,
+                "link": link_url,
+                "promo": promo_code or "",
+                "variant_id": f"v{random.randint(1000, 9999)}",
+                "anti_spam_seed": f"{int(time.time() * 1000)}-{random.randint(10000, 99999)}",
+            }
+            opener = random.choice([
+                "start with a question to the lead",
+                "start with an emoji, then the offer",
+                "start with the bonus amount first",
+                "start with urgency (limited time)",
+                "start with the activation instruction",
+                "start with a compliment then offer",
+                "start with curiosity hook, no greeting",
+                "start with the casino name and a bold claim",
+            ])
+            tone = random.choice([
+                "casual and friendly", "energetic and short",
+                "formal but warm", "playful with emojis",
+            ])
+            instruction = (
+                f"Write a UNIQUE WhatsApp outreach message. "
+                f"Seed={dynamic_variables['anti_spam_seed']} — your reply MUST differ from all previous ones. "
+                f"Opening style: {opener}. Tone: {tone}. "
+                f"Language={language}. Include link={{link}} and promo={{promo}} naturally. "
+                f"Max 3 sentences. Return ONLY the message text."
+            )
+            reply = await session.ask(
+                agent_id=agent_id,
+                context_text=WHATSAPP_CONTEXT,
+                prior_turns=[],
+                last_user_text=instruction,
+                language=None,
+                dynamic_variables=dynamic_variables,
+            )
+            result = _normalize_result(reply)
+            if not result:
+                continue
+            best = result
+            if _passes_language_guard(result):
+                return result
+            logger.warning("Outreach rejected by language/casino guard, regenerating")
+    finally:
+        # Outreach sessions are single-use — close the WebSocket immediately so we
+        # don't leak one open connection per lead in bulk sends.
+        outreach_key = f"outreach:{chat_key}"
+        _SESSIONS.pop(outreach_key, None)
+        await session.reset()
 
     # Hard fallback if the model keeps violating language/casino constraints.
     return _fallback_outreach(language=language, link_url=link_url, promo_code=promo_code)
@@ -569,12 +598,11 @@ async def _download_audio(
 
         if instance_id and api_token and message_id:
             try:
-                green_url = (
-                    f"https://7107.api.greenapi.com"
-                    f"/waInstance{instance_id}"
-                    f"/downloadFile/{api_token}"
+                from app.services.green_api import build_url
+                r = await client.post(
+                    build_url(instance_id, api_token, "downloadFile"),
+                    json={"idMessage": message_id},
                 )
-                r = await client.post(green_url, json={"idMessage": message_id})
                 if r.status_code == 200:
                     import base64
                     file_b64 = r.json().get("body", "")

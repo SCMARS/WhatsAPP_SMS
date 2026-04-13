@@ -41,12 +41,11 @@ async def _download_image(
 
         if instance_id and api_token and message_id:
             try:
-                green_url = (
-                    f"https://7107.api.greenapi.com"
-                    f"/waInstance{instance_id}"
-                    f"/downloadFile/{api_token}"
+                from app.services.green_api import build_url
+                r = await client.post(
+                    build_url(instance_id, api_token, "downloadFile"),
+                    json={"idMessage": message_id},
                 )
-                r = await client.post(green_url, json={"idMessage": message_id})
                 if r.status_code == 200:
                     file_b64 = r.json().get("body", "")
                     if file_b64:

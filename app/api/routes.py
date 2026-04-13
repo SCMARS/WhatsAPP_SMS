@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import random
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -74,7 +73,6 @@ def _split_outreach_into_three_random_parts(text: str) -> list[str]:
             parts.append(cleaned)
         parts = parts[:3]
 
-    random.shuffle(parts)
     return parts
 
 
@@ -253,7 +251,7 @@ async def _get_or_create_default_campaign(db: AsyncSession) -> Campaign:
     return campaign
 
 
-@router.get("/api/config")
+@router.get("/api/config", dependencies=[Depends(require_api_key)])
 async def get_public_config(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
@@ -302,8 +300,9 @@ async def send_message_endpoint(
             detail=f"Unsupported country for outbound link pool: {country_code}",
         )
 
-    # 2. Blacklist check
-    if await is_blacklisted(db, req.phone):
+    # 2. Blacklist check — normalize to digits so "+380..." matches "380..." in DB
+    _phone_digits = "".join(c for c in req.phone if c.isdigit())
+    if await is_blacklisted(db, _phone_digits) or await is_blacklisted(db, req.phone):
         return {"status": "blacklisted"}
 
     # 3. Claim a link from the pool (block if exhausted)
@@ -438,8 +437,9 @@ async def bulk_send_endpoint(
         if not lead.campaign_external_id:
             lead.campaign_external_id = req.campaign_external_id
 
-        # Blacklist check
-        if await is_blacklisted(db, lead.phone):
+        # Blacklist check — normalize to digits for consistent matching
+        _lead_digits = "".join(c for c in lead.phone if c.isdigit())
+        if await is_blacklisted(db, _lead_digits) or await is_blacklisted(db, lead.phone):
             results.append({"phone": lead.phone, "status": "blacklisted"})
             continue
 
@@ -749,13 +749,26 @@ async def create_campaign(
 async def list_instances(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    from app.services.reply_monitor import (
+        classify_block_rate,
+        classify_reply_rate,
+        get_all_block_rates,
+        get_all_reply_rates,
+    )
+    from app.services.pool import get_warmup_status
+
     result = await db.execute(select(WhatsAppInstance))
     instances = result.scalars().all()
-    stats = instance_pool.get_instance_stats()
+    stats        = instance_pool.get_instance_stats()
+    reply_rates  = await get_all_reply_rates(db)
+    block_rates  = await get_all_block_rates(db)
 
     data = []
     for inst in instances:
-        inst_stats = stats.get(inst.instance_id, {"hourly": 0, "daily": 0})
+        inst_stats  = stats.get(inst.instance_id, {"hourly": 0, "daily": 0})
+        rr          = reply_rates.get(inst.instance_id)
+        br          = block_rates.get(inst.instance_id)
+        warmup      = get_warmup_status(inst)
         data.append({
             "id": str(inst.id),
             "name": inst.name,
@@ -765,9 +778,97 @@ async def list_instances(
             "is_banned": inst.is_banned,
             "daily_limit": inst.daily_limit,
             "hourly_limit": inst.hourly_limit,
+            "eff_daily_limit":  warmup["eff_daily"],
+            "eff_hourly_limit": warmup["eff_hourly"],
             "hourly_sent": inst_stats["hourly"],
-            "daily_sent": inst_stats["daily"],
+            "daily_sent":  inst_stats["daily"],
             "health_status": inst.health_status,
+            # Reply rate
+            "reply_rate_7d":     round(rr, 4) if rr is not None else None,
+            "reply_rate_status": classify_reply_rate(rr),
+            # Block rate
+            "block_rate_7d":     round(br, 4) if br is not None else None,
+            "block_rate_status": classify_block_rate(br),
+            # Warmup
+            "in_warmup":           warmup["in_warmup"],
+            "warmup_age_days":     warmup["age_days"],
+            "warmup_days_left":    warmup["days_remaining"],
         })
 
     return {"instances": data, "total": len(data)}
+
+
+@router.get("/api/stats/reply-rates", dependencies=[Depends(require_api_key)])
+async def reply_rates_endpoint(
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Full anti-ban health report: reply rate + block rate for all instances.
+    Sort order: worst first (danger → warning → ok → no_data).
+    """
+    from app.services.reply_monitor import (
+        BLOCK_RATE_DANGER,
+        BLOCK_RATE_WARNING,
+        REPLY_RATE_DANGER,
+        REPLY_RATE_LOOKBACK_DAYS,
+        REPLY_RATE_WARNING,
+        classify_block_rate,
+        classify_reply_rate,
+        get_all_block_rates,
+        get_all_reply_rates,
+    )
+    from app.services.pool import get_warmup_status
+    from sqlalchemy import select as sa_select
+
+    reply_rates = await get_all_reply_rates(db)
+    block_rates = await get_all_block_rates(db)
+
+    # Gather all instance_ids that appear in either map
+    all_ids = set(reply_rates) | set(block_rates)
+
+    # Also load warmup info for each instance
+    inst_res = await db.execute(sa_select(WhatsAppInstance))
+    inst_map = {i.instance_id: i for i in inst_res.scalars().all()}
+
+    data = []
+    for inst_id in all_ids:
+        rr = reply_rates.get(inst_id)
+        br = block_rates.get(inst_id)
+        inst = inst_map.get(inst_id)
+        warmup = get_warmup_status(inst) if inst else None
+
+        rr_status = classify_reply_rate(rr)
+        br_status = classify_block_rate(br)
+        # Overall worst status
+        _order = {"danger": 0, "warning": 1, "ok": 2, "no_data": 3}
+        overall = min(rr_status, br_status, key=lambda s: _order.get(s, 9))
+
+        entry = {
+            "instance_id":       inst_id,
+            "overall_status":    overall,
+            "reply_rate":        round(rr, 4) if rr is not None else None,
+            "reply_rate_pct":    f"{rr * 100:.1f}%" if rr is not None else "n/a",
+            "reply_rate_status": rr_status,
+            "block_rate":        round(br, 4) if br is not None else None,
+            "block_rate_pct":    f"{br * 100:.2f}%" if br is not None else "n/a",
+            "block_rate_status": br_status,
+        }
+        if warmup:
+            entry["in_warmup"]        = warmup["in_warmup"]
+            entry["warmup_age_days"]  = warmup["age_days"]
+            entry["warmup_days_left"] = warmup["days_remaining"]
+        data.append(entry)
+
+    data.sort(key=lambda r: _order.get(r["overall_status"], 9))
+
+    return {
+        "lookback_days": REPLY_RATE_LOOKBACK_DAYS,
+        "thresholds": {
+            "reply_rate_warning": REPLY_RATE_WARNING,
+            "reply_rate_danger":  REPLY_RATE_DANGER,
+            "block_rate_warning": BLOCK_RATE_WARNING,
+            "block_rate_danger":  BLOCK_RATE_DANGER,
+        },
+        "instances": data,
+        "total": len(data),
+    }

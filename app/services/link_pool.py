@@ -58,6 +58,8 @@ async def load_links(db: AsyncSession, links: list[dict]) -> dict:
     loaded = 0
     skipped = 0
 
+    # Validate and deduplicate input
+    valid: list[tuple[str, str]] = []
     for item in links:
         url = (item.get("url") or "").strip()
         country = (item.get("country") or "").strip().upper()
@@ -68,15 +70,22 @@ async def load_links(db: AsyncSession, links: list[dict]) -> dict:
             logger.warning(f"Skipping link with unsupported country={country}: {url}")
             skipped += 1
             continue
+        valid.append((url, country))
 
-        # Check for duplicate
-        existing = await db.execute(
-            select(LinkPool).where(LinkPool.url == url)
-        )
-        if existing.scalar_one_or_none():
+    if not valid:
+        return {"loaded": loaded, "skipped": skipped}
+
+    # Single query to find all already-existing URLs (avoids N+1)
+    incoming_urls = [url for url, _ in valid]
+    existing_res = await db.execute(
+        select(LinkPool.url).where(LinkPool.url.in_(incoming_urls))
+    )
+    existing_urls: set[str] = set(existing_res.scalars().all())
+
+    for url, country in valid:
+        if url in existing_urls:
             skipped += 1
             continue
-
         db.add(LinkPool(url=url, country=country))
         loaded += 1
 

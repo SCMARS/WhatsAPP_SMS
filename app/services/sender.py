@@ -1,38 +1,89 @@
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Conversation, WhatsAppInstance, WhatsAppMessage
 from app.services import pool as instance_pool
+from app.services.green_api import build_url
 from app.services.rate_limiter import add_footer, insert_zero_width, reply_pause, wait_before_send
+
+# ---------------------------------------------------------------------------
+# checkWhatsapp cache — avoids hammering the API on every send.
+# TTL: 24 hours. Entry: {phone_digits: (exists: bool, checked_at: datetime)}
+# ---------------------------------------------------------------------------
+_whatsapp_cache: dict[str, tuple[bool, datetime]] = {}
+_CACHE_TTL_HOURS = 24
 
 logger = logging.getLogger(__name__)
 
 
 def _format_phone(phone: str) -> str:
     digits = "".join(c for c in phone if c.isdigit())
-    if not digits.endswith("@c.us"):
-        return f"{digits}@c.us"
-    return digits
+    return f"{digits}@c.us"
+
+
+async def _has_whatsapp(instance: WhatsAppInstance, phone: str) -> bool:
+    """
+    Return True if the phone number is registered on WhatsApp.
+    Results are cached for _CACHE_TTL_HOURS to avoid excessive API calls.
+    Fail-open: returns True on network errors so a blip doesn't block sends.
+    """
+    from app.services.green_api import check_whatsapp
+    digits = "".join(c for c in phone if c.isdigit())
+    now = datetime.now(timezone.utc)
+    cached = _whatsapp_cache.get(digits)
+    if cached:
+        exists, checked_at = cached
+        if (now - checked_at).total_seconds() < _CACHE_TTL_HOURS * 3600:
+            return exists
+    exists = await check_whatsapp(instance.instance_id, instance.api_token, digits)
+    _whatsapp_cache[digits] = (exists, now)
+    return exists
 
 
 async def read_chat(db: AsyncSession, conversation: Conversation) -> bool:
-    """Mark a chat as read in Green API. This helps with E2EE sync."""
-    instance = await instance_pool.get_best_instance(db, is_reservation=False)
+    """Mark a chat as read in Green API. This helps with E2EE sync.
+
+    Uses the same instance that last sent a message to this conversation so the
+    read-receipt comes from the correct WhatsApp number.
+    """
+    from sqlalchemy import select as sa_select
+    # Find the instance that last sent to this conversation
+    msg_res = await db.execute(
+        sa_select(WhatsAppMessage)
+        .where(
+            WhatsAppMessage.conversation_id == conversation.id,
+            WhatsAppMessage.direction == "outbound",
+            WhatsAppMessage.instance_id.isnot(None),
+        )
+        .order_by(WhatsAppMessage.created_at.desc())
+        .limit(1)
+    )
+    last_msg = msg_res.scalar_one_or_none()
+
+    instance: Optional[WhatsAppInstance] = None
+    if last_msg and last_msg.instance_id:
+        inst_res = await db.execute(
+            sa_select(WhatsAppInstance).where(WhatsAppInstance.id == last_msg.instance_id)
+        )
+        instance = inst_res.scalar_one_or_none()
+
+    # Fall back to any available instance if conversation has no prior outbound message
+    if not instance:
+        instance = await instance_pool.get_best_instance(db, is_reservation=False)
     if not instance:
         return False
 
     chat_id = _format_phone(conversation.phone)
-    url = (
-        f"https://7107.api.greenapi.com"
-        f"/waInstance{instance.instance_id}"
-        f"/readChat/{instance.api_token}"
-    )
     import httpx
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(url, json={"chatId": chat_id})
+            resp = await client.post(
+                build_url(instance.instance_id, instance.api_token, "readChat"),
+                json={"chatId": chat_id},
+            )
             return resp.status_code == 200
     except Exception as e:
         logger.warning(f"Failed to readChat for {chat_id}: {e}")
@@ -61,6 +112,14 @@ async def send_message(
     # Append opt-out footer only for outbound broadcast (not AI replies)
     if not is_reply:
         personalized = add_footer(personalized)
+
+    # Pre-flight: verify the number is on WhatsApp before sending.
+    # Avoids noAccount webhook red-flags; result is cached for 24 h.
+    if not await _has_whatsapp(instance, conversation.phone):
+        from app.services.blacklist import add_to_blacklist
+        logger.warning(f"Phone {conversation.phone} has no WhatsApp — blacklisting, skipping send")
+        await add_to_blacklist(db, conversation.phone, reason="no_whatsapp")
+        return None
 
     if is_reply:
         # Short human-like typing delay for AI replies (2–5s)
@@ -129,36 +188,29 @@ async def _do_send(
 
     # Send "typing..." indicator first
     typing_ms = calc_typing_time(text)
-    typing_url = (
-        f"https://7107.api.greenapi.com"
-        f"/waInstance{instance.instance_id}"
-        f"/sendTyping/{instance.api_token}"
-    )
     typing_payload = {
         "chatId": chat_id,
-        "typingTime": typing_ms
+        "typingTime": max(1, typing_ms // 1000),  # Green API expects seconds
     }
-
-    url = (
-        f"https://7107.api.greenapi.com"
-        f"/waInstance{instance.instance_id}"
-        f"/sendMessage/{instance.api_token}"
-    )
+    typing_url = build_url(instance.instance_id, instance.api_token, "sendTyping")
+    url = build_url(instance.instance_id, instance.api_token, "sendMessage")
     payload = {
         "chatId": chat_id,
         "message": text,
         "linkPreview": False,
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            # 1. Fire typing indicator
+    # 1. Fire typing indicator (separate client — don't hold connection during sleep)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             await client.post(typing_url, json=typing_payload)
-            # 2. Emulate the typing duration
-            await asyncio.sleep(typing_ms / 1000.0)
-        except Exception as e:
-            logger.warning(f"Failed to send typing indicator: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to send typing indicator: {e}")
 
-        # 3. Actually send the message
+    # 2. Emulate typing duration — outside any open HTTP client
+    await asyncio.sleep(typing_ms / 1000.0)
+
+    # 3. Actually send the message
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, json=payload)
 
     if resp.status_code in (403, 429):
