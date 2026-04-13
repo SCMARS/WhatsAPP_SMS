@@ -11,8 +11,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.config import settings
 from app.db.session import init_db
 from app.api.routes import router
+from app.api.telegram_routes import router as tg_router
 from app.services.ignore_followup import run_ignore_followup_worker
 from app.services.health_monitor import run_health_monitor
+from app.services.telegram.client_manager import startup_all_clients, shutdown_all_clients
+from app.services.telegram.health_monitor import run_tg_health_monitor
 
 logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
@@ -49,21 +52,31 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting WR WhatsApp Service...")
+    logger.info("Starting WR WhatsApp + Telegram Service...")
     await init_db()
     logger.info("Database initialized")
+
+    # Start background workers
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(run_ignore_followup_worker(stop_event))
     health_task = asyncio.create_task(run_health_monitor(stop_event))
+
+    # Connect all authorized Telegram accounts and start TG health monitor
+    await startup_all_clients()
+    tg_health_task = asyncio.create_task(run_tg_health_monitor(stop_event))
+
     yield
+
     stop_event.set()
-    for task in (worker_task, health_task):
+    for task in (worker_task, health_task, tg_health_task):
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-    logger.info("Shutting down WR WhatsApp Service")
+
+    await shutdown_all_clients()
+    logger.info("Shutting down WR WhatsApp + Telegram Service")
 
 
 app = FastAPI(
@@ -90,6 +103,7 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(tg_router)
 
 
 if __name__ == "__main__":

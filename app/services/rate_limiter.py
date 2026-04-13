@@ -25,8 +25,8 @@ def spin_text(template: str, contact: Optional[dict] = None) -> str:
 
 
 def add_footer(text: str) -> str:
-    """Append opt-out instructions to outbound broadcast messages."""
-    return text + "\n\n_Щоб відписатись — відповідайте 'Стоп'_"
+    """Outbound messages are sent as-is without any auto-appended footer."""
+    return text
 
 
 async def reply_pause(min_sec: float = 4.0, max_sec: float = 8.0) -> None:
