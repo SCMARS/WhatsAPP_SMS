@@ -111,6 +111,22 @@ def _missing_required_fields(
     return missing
 
 
+def _clickability_trigger(language: str) -> str:
+    """Randomized instruction to encourage a reply so the link becomes clickable."""
+    if language == "es-AR":
+        return random.choice([
+            "¡Podés mandarme un emoji para que el link sea clicable! 👍",
+            "Mandame cualquier emoji para activar el link ahora mismo. 😉",
+            "Respondeme con un emoji y el link se volverá azul y clicable al toque. 🚀",
+        ])
+    # Default: pt-PT
+    return random.choice([
+        "Podes responder com um emoji para o link ficar clicável! 👍",
+        "Envia-me um emoji rápido para ativares o link. 😉",
+        "Responde com qualquer emoji para o link ficar azul e clicável. 🚀",
+    ])
+
+
 def _missing_fields_tail(
     language: str,
     *,
@@ -122,28 +138,50 @@ def _missing_fields_tail(
         return ""
 
     if language == "es-AR":
-        bits = []
+        parts = []
         if "promo" in missing_fields and promo_code:
-            bits.append(f"Código: {promo_code}.")
+            parts.append(random.choice([
+                f"Aprovechá con el código: {promo_code}.",
+                f"Tu código de bono es {promo_code}.",
+                f"Usá el código {promo_code} para activar el regalo.",
+            ]))
         if "link" in missing_fields and link_url:
-            bits.append(f"Link de activación: {link_url}.")
-        return " ".join(bits).strip()
+            parts.append(random.choice([
+                f"Acá tenés el link: {link_url}",
+                f"Entrá por acá para jugar: {link_url}",
+                f"Link de activación: {link_url}",
+            ]))
+        return " ".join(parts).strip()
 
-    bits = []
+    # Default: pt-PT
+    parts = []
     if "promo" in missing_fields and promo_code:
-        bits.append(f"Código: {promo_code}.")
+        parts.append(random.choice([
+            f"Usa o teu código: {promo_code}.",
+            f"O teu bónus ativa-se com o código {promo_code}.",
+            f"Código promocional: {promo_code}.",
+        ]))
     if "link" in missing_fields and link_url:
-        bits.append(f"Link de ativação: {link_url}.")
-    return " ".join(bits).strip()
+        parts.append(random.choice([
+            f"Aqui tens o link para começar: {link_url}",
+            f"Usa este link de ativação: {link_url}",
+            f"Segue este link: {link_url}",
+        ]))
+    return " ".join(parts).strip()
 
 
 def _ensure_required_outreach_fields(
     text: str,
-    *,
     language: str,
+    *,
     link_url: Optional[str] = None,
     promo_code: Optional[str] = None,
 ) -> str:
+    """
+    1. Substitutes placeholders.
+    2. Appends missing mandatory fields (link/promo) naturally.
+    3. Appends a 'clickability trigger' instruction at the very end.
+    """
     result = _substitute_dynamic_placeholders(
         text,
         language=language,
@@ -155,18 +193,21 @@ def _ensure_required_outreach_fields(
         link_url=link_url,
         promo_code=promo_code,
     )
-    if not missing_fields:
-        return result
-
-    tail = _missing_fields_tail(
-        language,
-        missing_fields=missing_fields,
-        link_url=link_url,
-        promo_code=promo_code,
-    )
-    if not tail:
-        return result
-    return f"{result} {tail}".strip() if result else tail
+    
+    # Add link/promo if missing
+    if missing_fields:
+        tail = _missing_fields_tail(
+            language,
+            missing_fields=missing_fields,
+            link_url=link_url,
+            promo_code=promo_code,
+        )
+        if tail:
+            result = f"{result} {tail}".strip()
+            
+    # Always add the activation trigger at the very end
+    trigger = _clickability_trigger(language)
+    return f"{result} {trigger}".strip() if result else trigger
 
 
 def _fallback_outreach(language: str, link_url: str, promo_code: Optional[str]) -> str:
@@ -709,8 +750,10 @@ async def _generate_outreach_message_inner(
                     f"({len(result)} chars): {result}"
                 )
                 return result
+            
             logger.warning(
-                f"Outreach attempt {attempt} rejected by language guard: {result[:120]}"
+                f"Outreach attempt {attempt} rejected by language guard "
+                f"(expected {language}): {result[:120]}..."
             )
     finally:
         # Outreach sessions are single-use — close the WebSocket immediately so we

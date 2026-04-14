@@ -50,14 +50,14 @@ def add_footer(text: str) -> str:
     return text
 
 
-async def reply_pause(min_sec: float = 6.0, max_sec: float = 12.0) -> None:
+async def reply_pause(min_sec: float = 12.0, max_sec: float = 28.0) -> None:
     """Human-like pause between consecutive messages in a sequence."""
     delay = random.uniform(min_sec, max_sec)
     logger.debug(f"Reply pause: {delay:.1f}s")
     await asyncio.sleep(delay)
 
 
-async def initial_compose_pause(min_sec: float = 8.0, max_sec: float = 18.0) -> None:
+async def initial_compose_pause(min_sec: float = 18.0, max_sec: float = 38.0) -> None:
     """Extra thinking delay before the first outbound message to reduce bot-like speed."""
     delay = random.uniform(min_sec, max_sec)
     logger.debug(f"Initial compose pause: {delay:.1f}s")
