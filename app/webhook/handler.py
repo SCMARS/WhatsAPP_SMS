@@ -343,8 +343,26 @@ async def _handle_incoming_locked(
         return
 
     # 11. Generate reply via ElevenLabs
-    # For replies to inbound messages, pass empty dynamic variables.
-    # This tells the agent NOT to include promo/link (those are for initial outreach only).
+    # Look up the real link/promo for this lead so the agent can include them in replies.
+    reply_link = ""
+    reply_promo = ""
+    try:
+        from app.db.models import LinkPool
+        from app.services.country import detect_country
+        lp_res = await db.execute(
+            select(LinkPool).where(
+                LinkPool.lead_id == conversation.lead_id,
+                LinkPool.used == True,
+            ).order_by(LinkPool.id).limit(1)
+        )
+        lp = lp_res.scalar_one_or_none()
+        if lp:
+            reply_link = lp.url or ""
+        country_info = detect_country(conversation.phone)
+        reply_promo = country_info.get("promo") or ""
+    except Exception:
+        pass
+
     try:
         reply = await generate_text_reply(
             agent_id=campaign.agent_id,
@@ -352,7 +370,7 @@ async def _handle_incoming_locked(
             history=llm_history,
             lead_name=conversation.lead_name,
             chat_key=conversation.phone,
-            dynamic_variables={"promo": "", "link": ""},  # Empty for reply (not initial outreach)
+            dynamic_variables={"promo": reply_promo, "link": reply_link},
         )
     except Exception as e:
         logger.error(f"ElevenLabs failed: {e}")

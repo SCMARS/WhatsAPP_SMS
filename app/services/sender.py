@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Conversation, WhatsAppInstance, WhatsAppMessage
 from app.services import pool as instance_pool
 from app.services.green_api import build_url
-from app.services.rate_limiter import add_footer, insert_zero_width, reply_pause, wait_before_send
+from app.services.rate_limiter import (
+    add_footer,
+    initial_compose_pause,
+    insert_zero_width,
+    reply_pause,
+    wait_before_send,
+)
 
 # ---------------------------------------------------------------------------
 # checkWhatsapp cache — avoids hammering the API on every send.
@@ -122,11 +128,13 @@ async def send_message(
         return None
 
     if is_reply:
-        # Short human-like typing delay for AI replies (2–5s)
+        # Short human-like typing delay for AI replies.
         await reply_pause()
     else:
-        # Wait for per-instance cooldown; batch_pause is now the caller's responsibility
+        # Wait for per-instance cooldown, then add a compose pause so the first
+        # outreach does not fire with bot-like immediacy.
         await wait_before_send(instance)
+        await initial_compose_pause()
 
     chat_id = _format_phone(conversation.phone)
     provider_message_id: Optional[str] = None
@@ -296,6 +304,6 @@ async def send_initial_message(
 
         # Wait before the next part of a multi-part message
         if i < len(messages) - 1:
-            await reply_pause(min_sec=3.0, max_sec=6.0)
+            await reply_pause(min_sec=8.0, max_sec=16.0)
 
     return last_msg

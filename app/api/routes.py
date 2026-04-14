@@ -35,45 +35,116 @@ def _to_elevenlabs_language(lang: Optional[str]) -> str:
     return "pt-PT"
 
 
-def _split_outreach_into_three_random_parts(text: str) -> list[str]:
+def _split_outreach_into_three_random_parts(
+    text: str,
+    *,
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> list[str]:
     """
-    Split outreach text into 3 non-empty parts and shuffle them.
-    This creates natural variation in message order.
+    Split outreach text into 3 meaningful parts at sentence boundaries.
+    Short fragments (< 30 chars) are merged with the next sentence so no part
+    is just "¡Hola!" on its own. Splits always happen at sentence boundaries,
+    never mid-sentence. If the link/promo land in a later chunk, the critical
+    chunk is merged into the first message so the lead sees the CTA immediately.
     """
+    MIN_PART_LEN = 30
+
+    def _normalize_parts(parts: list[str]) -> list[str]:
+        return [" ".join((part or "").split()).strip() for part in parts if (part or "").strip()]
+
+    def _has_required_fields(part: str) -> bool:
+        if link_url and link_url not in part:
+            return False
+        if promo_code and promo_code not in part:
+            return False
+        return True
+
+    def _promote_critical_chunk(parts: list[str]) -> list[str]:
+        normalized = _normalize_parts(parts)
+        if len(normalized) <= 1 or _has_required_fields(normalized[0]):
+            return normalized
+
+        critical_indexes = [
+            idx for idx, part in enumerate(normalized)
+            if (link_url and link_url in part) or (promo_code and promo_code in part)
+        ]
+        if not critical_indexes:
+            return normalized
+
+        merged_indexes = {0, *critical_indexes}
+        first_part = " ".join(normalized[idx] for idx in sorted(merged_indexes)).strip()
+        remaining = [part for idx, part in enumerate(normalized) if idx not in merged_indexes]
+        return [first_part, *remaining]
+
     cleaned = " ".join((text or "").split()).strip()
     if not cleaned:
         return []
 
-    # Prefer sentence-like chunks first.
-    sentence_parts = [
+    # Split on sentence boundaries (.!?) followed by whitespace.
+    raw_sentences = [
         part.strip()
         for part in re.split(r"(?<=[.!?])\s+", cleaned)
         if part.strip()
     ]
 
-    parts: list[str]
-    if len(sentence_parts) >= 3:
-        parts = sentence_parts[:3]
-        if len(sentence_parts) > 3:
-            parts[-1] = f"{parts[-1]} {' '.join(sentence_parts[3:])}".strip()
-    else:
-        # Fallback: split by words into near-equal thirds.
-        words = cleaned.split()
-        total = len(words)
-        a = max(1, total // 3)
-        b = max(a + 1, (2 * total) // 3)
-        parts = [
-            " ".join(words[:a]).strip(),
-            " ".join(words[a:b]).strip(),
-            " ".join(words[b:]).strip(),
-        ]
-        # Repair any empty part for very short texts.
-        parts = [p for p in parts if p]
-        while len(parts) < 3:
-            parts.append(cleaned)
-        parts = parts[:3]
+    # Merge short fragments with the next sentence so each chunk is meaningful.
+    merged: list[str] = []
+    buf = ""
+    for sent in raw_sentences:
+        buf = f"{buf} {sent}".strip() if buf else sent
+        if len(buf) >= MIN_PART_LEN:
+            merged.append(buf)
+            buf = ""
+    if buf:
+        if merged:
+            merged[-1] = f"{merged[-1]} {buf}"
+        else:
+            merged.append(buf)
 
-    return parts
+    if len(merged) >= 3:
+        parts = merged[:3]
+        if len(merged) > 3:
+            parts[-1] = f"{parts[-1]} {' '.join(merged[3:])}".strip()
+        return _promote_critical_chunk(parts)
+
+    def _split_chunk_at_sentence_boundary(chunk: str) -> tuple[str, str]:
+        """Split chunk into two at the sentence boundary nearest to the midpoint."""
+        subs = [s.strip() for s in re.split(r"(?<=[.!?])\s+", chunk) if s.strip()]
+        if len(subs) < 2:
+            # No sentence boundary — split by words at midpoint
+            words = chunk.split()
+            mid = max(1, len(words) // 2)
+            return " ".join(words[:mid]), " ".join(words[mid:]) or chunk
+        mid_char = len(chunk) / 2
+        pos = 0
+        best_split = 1
+        best_dist = float("inf")
+        for i, s in enumerate(subs[:-1]):
+            pos += len(s) + 1
+            dist = abs(pos - mid_char)
+            if dist < best_dist:
+                best_dist = dist
+                best_split = i + 1
+        return " ".join(subs[:best_split]), " ".join(subs[best_split:])
+
+    if len(merged) == 2:
+        longer_idx = 0 if len(merged[0]) >= len(merged[1]) else 1
+        shorter_idx = 1 - longer_idx
+        half_a, half_b = _split_chunk_at_sentence_boundary(merged[longer_idx])
+        if longer_idx == 0:
+            parts = [half_a, half_b, merged[shorter_idx]]
+        else:
+            parts = [merged[shorter_idx], half_a, half_b]
+        return _promote_critical_chunk(parts)
+
+    # Single chunk — split into thirds by sentence boundary.
+    half_a, rest = _split_chunk_at_sentence_boundary(cleaned)
+    half_b, half_c = _split_chunk_at_sentence_boundary(rest)
+    parts = [p for p in [half_a, half_b, half_c] if p]
+    while len(parts) < 3:
+        parts.append(cleaned)
+    return _promote_critical_chunk(parts[:3])
 
 
 def _opening_key(text: str, words: int = 6) -> str:
@@ -143,7 +214,11 @@ async def _resolve_initial_message(
             ),
         )
 
-    parts = _split_outreach_into_three_random_parts(message)
+    parts = _split_outreach_into_three_random_parts(
+        message,
+        link_url=link_url,
+        promo_code=promo_code,
+    )
     return parts or [message]
 
 

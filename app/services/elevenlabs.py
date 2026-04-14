@@ -16,6 +16,7 @@ import random
 import re
 import ssl
 import time
+import uuid
 from typing import Optional
 
 import certifi
@@ -29,10 +30,27 @@ logger = logging.getLogger(__name__)
 
 ELEVENLABS_BASE = "https://api.elevenlabs.io/v1"
 
+# Limit concurrent WebSocket connections to ElevenLabs to avoid DNS/connection failures
+# during bulk sends (each lead opens 2 WS connections due to warmup→reconnect).
+_WS_SEMAPHORE = asyncio.Semaphore(5)
+
 WHATSAPP_CONTEXT = (
     "This is a WhatsApp text chat. Keep your reply short — max 3-4 sentences. "
     "Plain text only, no markdown."
 )
+
+STYLE_HINTS = [
+    "Start with a question.",
+    "Open with the bonus offer directly.",
+    "Start with a compliment to the player.",
+    "Open with urgency — limited time.",
+    "Start very casually, like you haven't talked in a while.",
+    "Lead with the link, explain after.",
+    "Start with a personal greeting.",
+    "Open with surprise — act like you have exclusive news.",
+    "Begin with a short emoji.",
+    "Start by mentioning the player's name naturally.",
+]
 
 
 def _ssl_ctx() -> ssl.SSLContext:
@@ -58,6 +76,97 @@ def _normalize_dynamic_variables(dynamic_variables: Optional[dict[str, str]]) ->
     if not dynamic_variables:
         return {}
     return {str(k): str(v) for k, v in dynamic_variables.items() if v is not None}
+
+
+def _substitute_dynamic_placeholders(
+    text: str,
+    *,
+    language: Optional[str] = None,
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> str:
+    result = text or ""
+    replacements = {
+        "language": language or "",
+        "link": link_url or "",
+        "promo": promo_code or "",
+    }
+    for key, value in replacements.items():
+        result = re.sub(rf"\{{\{{\s*{re.escape(key)}\s*\}}\}}", value, result, flags=re.IGNORECASE)
+        result = re.sub(rf"\{{\s*{re.escape(key)}\s*\}}", value, result, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def _missing_required_fields(
+    text: str,
+    *,
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> list[str]:
+    missing: list[str] = []
+    if link_url and link_url not in text:
+        missing.append("link")
+    if promo_code and promo_code not in text:
+        missing.append("promo")
+    return missing
+
+
+def _missing_fields_tail(
+    language: str,
+    *,
+    missing_fields: list[str],
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> str:
+    if not missing_fields:
+        return ""
+
+    if language == "es-AR":
+        bits = []
+        if "promo" in missing_fields and promo_code:
+            bits.append(f"Código: {promo_code}.")
+        if "link" in missing_fields and link_url:
+            bits.append(f"Link de activación: {link_url}.")
+        return " ".join(bits).strip()
+
+    bits = []
+    if "promo" in missing_fields and promo_code:
+        bits.append(f"Código: {promo_code}.")
+    if "link" in missing_fields and link_url:
+        bits.append(f"Link de ativação: {link_url}.")
+    return " ".join(bits).strip()
+
+
+def _ensure_required_outreach_fields(
+    text: str,
+    *,
+    language: str,
+    link_url: Optional[str] = None,
+    promo_code: Optional[str] = None,
+) -> str:
+    result = _substitute_dynamic_placeholders(
+        text,
+        language=language,
+        link_url=link_url,
+        promo_code=promo_code,
+    )
+    missing_fields = _missing_required_fields(
+        result,
+        link_url=link_url,
+        promo_code=promo_code,
+    )
+    if not missing_fields:
+        return result
+
+    tail = _missing_fields_tail(
+        language,
+        missing_fields=missing_fields,
+        link_url=link_url,
+        promo_code=promo_code,
+    )
+    if not tail:
+        return result
+    return f"{result} {tail}".strip() if result else tail
 
 
 def _fallback_outreach(language: str, link_url: str, promo_code: Optional[str]) -> str:
@@ -347,6 +456,9 @@ async def generate_text_reply(
     if lead_name:
         context_parts.append(f"Customer name: {lead_name}.")
     context_parts.append(WHATSAPP_CONTEXT)
+    style_hint = random.choice(STYLE_HINTS)
+    uid = str(uuid.uuid4())[:8]
+    context_parts.append(f"Style for this message: {style_hint} [uid:{uid}]")
     context_text = " ".join(context_parts)
 
     key = chat_key or agent_id
@@ -446,11 +558,12 @@ async def get_outreach_message(
         return ""
 
     # Substitute placeholders — support both {link}/{promo} and {{link}}/{{promo}}
-    result = template
-    result = result.replace("{{link}}",  link_url   or "")
-    result = result.replace("{{promo}}", promo_code or "")
-    result = result.replace("{link}",    link_url   or "")
-    result = result.replace("{promo}",   promo_code or "")
+    result = _ensure_required_outreach_fields(
+        template,
+        language="pt-PT",
+        link_url=link_url,
+        promo_code=promo_code,
+    )
 
     logger.info("ElevenLabs outreach message fetched (%d chars)", len(result))
     return result
@@ -467,6 +580,23 @@ async def generate_outreach_message(
     Generate initial outbound message via ElevenLabs ConvAI WebSocket.
     Uses dynamic variables consumed by the agent prompt: {language}, {link}, {promo}.
     """
+    async with _WS_SEMAPHORE:
+        return await _generate_outreach_message_inner(
+            agent_id=agent_id,
+            chat_key=chat_key,
+            language=language,
+            link_url=link_url,
+            promo_code=promo_code,
+        )
+
+
+async def _generate_outreach_message_inner(
+    agent_id: str,
+    chat_key: str,
+    language: str,
+    link_url: str,
+    promo_code: Optional[str] = None,
+) -> str:
     session = _get_session(f"outreach:{chat_key}")
 
     # Warm-up turn: many agents send default "first message" greeting on a fresh WS session.
@@ -486,17 +616,12 @@ async def generate_outreach_message(
         pass
 
     def _normalize_result(text: str) -> str:
-        result = (text or "").strip()
-        if not result:
-            return ""
-        # Safety net: if the model outputs literal placeholders, replace them locally.
-        result = result.replace("{{link}}", link_url or "")
-        result = result.replace("{{promo}}", promo_code or "")
-        result = result.replace("{{language}}", language or "")
-        result = result.replace("{link}", link_url or "")
-        result = result.replace("{promo}", promo_code or "")
-        result = result.replace("{language}", language or "")
-        return result.strip()
+        return _ensure_required_outreach_fields(
+            text,
+            language=language,
+            link_url=link_url,
+            promo_code=promo_code,
+        )
 
     def _passes_language_guard(text: str) -> bool:
         import re as _re
@@ -549,7 +674,8 @@ async def generate_outreach_message(
                 f"Write a UNIQUE WhatsApp outreach message. "
                 f"Seed={dynamic_variables['anti_spam_seed']} — your reply MUST differ from all previous ones. "
                 f"Opening style: {opener}. Tone: {tone}. "
-                f"Language={language}. Include link={{link}} and promo={{promo}} naturally. "
+                f"Language={language}. Include the resolved final link={{link}} and promo={{promo}} naturally. "
+                f"Do not output placeholders like {{link}} or {{promo}}. "
                 f"Max 3 sentences. Return ONLY the message text."
             )
             reply = await session.ask(
@@ -562,11 +688,30 @@ async def generate_outreach_message(
             )
             result = _normalize_result(reply)
             if not result:
+                logger.warning(f"Outreach attempt {attempt}: empty reply from agent")
                 continue
+            missing_fields = _missing_required_fields(
+                result,
+                link_url=link_url,
+                promo_code=promo_code,
+            )
+            if missing_fields:
+                logger.warning(
+                    "Outreach attempt %s missing required fields=%s after normalization: %s",
+                    attempt,
+                    ",".join(missing_fields),
+                    result[:160],
+                )
             best = result
             if _passes_language_guard(result):
+                logger.info(
+                    f"Outreach generated [{language}] attempt={attempt} "
+                    f"({len(result)} chars): {result}"
+                )
                 return result
-            logger.warning("Outreach rejected by language/casino guard, regenerating")
+            logger.warning(
+                f"Outreach attempt {attempt} rejected by language guard: {result[:120]}"
+            )
     finally:
         # Outreach sessions are single-use — close the WebSocket immediately so we
         # don't leak one open connection per lead in bulk sends.
@@ -575,7 +720,12 @@ async def generate_outreach_message(
         await session.reset()
 
     # Hard fallback if the model keeps violating language/casino constraints.
-    return _fallback_outreach(language=language, link_url=link_url, promo_code=promo_code)
+    return _ensure_required_outreach_fields(
+        _fallback_outreach(language=language, link_url=link_url, promo_code=promo_code),
+        language=language,
+        link_url=link_url,
+        promo_code=promo_code,
+    )
 
 
 async def _download_audio(
