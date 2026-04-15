@@ -672,15 +672,26 @@ async def get_outreach_message(
     return result
 
 
+def _parse_three_parts(raw: str) -> Optional[list[str]]:
+    """Parse LLM output into exactly 3 parts split by ---."""
+    # Strip labels like "Message 1:" that LLM sometimes adds
+    cleaned = re.sub(r"(?m)^(Message|Mensaje|Mensagem)\s*\d+\s*:\s*", "", raw)
+    parts = [p.strip() for p in re.split(r"\n*---\n*", cleaned) if p.strip()]
+    if len(parts) == 3:
+        return parts
+    return None
+
+
 async def generate_outreach_message(
     agent_id: str,
     chat_key: str,
     language: str,
     link_url: str,
     promo_code: Optional[str] = None,
-) -> str:
+) -> list[str]:
     """
     Generate initial outbound message via ElevenLabs ConvAI WebSocket.
+    Returns a list of 3 strings (greeting, offer, trigger).
     Uses dynamic variables consumed by the agent prompt: {language}, {link}, {promo}.
     """
     async with _WS_SEMAPHORE:
@@ -699,7 +710,7 @@ async def _generate_outreach_message_inner(
     language: str,
     link_url: str,
     promo_code: Optional[str] = None,
-) -> str:
+) -> list[str]:
     session = _get_session(f"outreach:{chat_key}")
 
     # Warm-up turn: many agents send default "first message" greeting on a fresh WS session.
@@ -725,6 +736,33 @@ async def _generate_outreach_message_inner(
             link_url=link_url,
             promo_code=promo_code,
         )
+
+    def _clean_part(text: str) -> str:
+        """Clean a single part: substitute placeholders, remove hallucinated URLs."""
+        result = _substitute_dynamic_placeholders(
+            text, language=language, link_url=link_url, promo_code=promo_code,
+        )
+        # Remove hallucinated URLs (both with and without https://) that don't match the real link
+        if link_url:
+            import re as _re
+            # Match full URLs (https://...) and bare domain URLs (domain.com/...)
+            real_domain = link_url.split("//")[-1].split("/")[0]  # e.g. "oro.casino" or "pampas.casino"
+            for url in _re.findall(r"(?:https?://\S+|(?<!\w)" + _re.escape(real_domain) + r"/\S+)", result):
+                clean_url = url.rstrip(".,!?;:")
+                # Keep only if it matches the real link
+                if clean_url == link_url or link_url.endswith(clean_url) or clean_url.startswith(link_url):
+                    continue
+                # Also keep if it's just the real link without protocol
+                real_no_proto = link_url.split("//")[-1]
+                if clean_url == real_no_proto:
+                    continue
+                result = result.replace(url, "").strip()
+            # Clean up double spaces left after removal
+            result = _re.sub(r"  +", " ", result).strip()
+            # Clean up orphaned punctuation like ": !" or "acá: !"
+            result = _re.sub(r":\s*!", "!", result)
+            result = _re.sub(r"acá:\s*$", f"acá: {link_url}", result)
+        return result
 
     def _passes_language_guard(text: str) -> bool:
         import re as _re
@@ -760,26 +798,38 @@ async def _generate_outreach_message_inner(
                 "anti_spam_seed": f"{int(time.time() * 1000)}-{random.randint(10000, 99999)}",
             }
             opener = random.choice([
-                "start with a question to the lead",
-                "start with an emoji, then the offer",
-                "start with the bonus amount first",
-                "start with urgency (limited time)",
-                "start with the activation instruction",
-                "start with a compliment then offer",
-                "start with curiosity hook, no greeting",
-                "start with the casino name and a bold claim",
+                "start with a warm personal greeting",
+                "start with a friendly intro mentioning your name",
+                "open casually like you just met the person",
+                "start with a compliment then introduce yourself",
+                "start with your name and a warm emoji",
             ])
             tone = random.choice([
                 "casual and friendly", "energetic and short",
                 "formal but warm", "playful with emojis",
             ])
+
+            if language == "es-AR":
+                offer_hint = "175% bonus on next deposit from ARS 5000, valid 5 days"
+            else:
+                offer_hint = "50 Free Spins in Pragmatic Play with code {promo}, valid 5 days"
+
             instruction = (
-                f"Write a UNIQUE WhatsApp outreach message. "
-                f"Seed={dynamic_variables['anti_spam_seed']} — your reply MUST differ from all previous ones. "
-                f"Opening style: {opener}. Tone: {tone}. "
-                f"Language={language}. Include the resolved final link={{link}} and promo={{promo}} naturally. "
-                f"Do not output placeholders like {{link}} or {{promo}}. "
-                f"Max 3 sentences. Return ONLY the message text."
+                f"Write a UNIQUE WhatsApp outreach as EXACTLY 3 separate messages divided by ---\n"
+                f"Seed={dynamic_variables['anti_spam_seed']} — your reply MUST differ from all previous ones.\n"
+                f"Opening style: {opener}. Tone: {tone}.\n"
+                f"Language={language}.\n\n"
+                f"FORMAT (follow STRICTLY):\n"
+                f"Message 1: Personal greeting — introduce yourself, say it was a pleasure chatting. 1 sentence.\n"
+                f"---\n"
+                f"Message 2: The offer — {offer_hint}. Include the link {{link}} and promo code {{promo}} if applicable. 1-2 sentences.\n"
+                f"---\n"
+                f"Message 3: Tell them the link becomes clickable when they reply anything (even emoji). End with good luck. 1 sentence.\n\n"
+                f"RULES:\n"
+                f"- Do NOT output placeholders like {{link}} or {{promo}} — use the actual values.\n"
+                f"- Max 2 emoji per message.\n"
+                f"- Return ONLY the 3 messages separated by ---\n"
+                f"- No labels like 'Message 1:' — just the text."
             )
             reply = await session.ask(
                 agent_id=agent_id,
@@ -789,33 +839,49 @@ async def _generate_outreach_message_inner(
                 language=None,
                 dynamic_variables=dynamic_variables,
             )
-            result = _normalize_result(reply)
-            if not result:
+            if not reply:
                 logger.warning(f"Outreach attempt {attempt}: empty reply from agent")
                 continue
+
+            # Try to parse 3 structured parts
+            parts = _parse_three_parts(reply)
+            if not parts:
+                logger.warning(
+                    f"Outreach attempt {attempt}: could not parse 3 parts from: {reply[:160]}"
+                )
+                # Normalize as single string fallback
+                result = _normalize_result(reply)
+                if result and _passes_language_guard(result):
+                    best = result
+                continue
+
+            # Clean each part: substitute placeholders, remove hallucinated URLs
+            parts = [_clean_part(p) for p in parts]
+
+            # Ensure link/promo are present in the full message
+            full_text = " ".join(parts)
             missing_fields = _missing_required_fields(
-                result,
-                link_url=link_url,
-                promo_code=promo_code,
+                full_text, link_url=link_url, promo_code=promo_code,
             )
             if missing_fields:
-                logger.warning(
-                    "Outreach attempt %s missing required fields=%s after normalization: %s",
-                    attempt,
-                    ",".join(missing_fields),
-                    result[:160],
+                # Patch part 2 with missing fields
+                tail = _missing_fields_tail(
+                    language, missing_fields=missing_fields,
+                    link_url=link_url, promo_code=promo_code,
                 )
-            best = result
-            if _passes_language_guard(result):
+                if tail:
+                    parts[1] = f"{parts[1]} {tail}".strip()
+
+            if _passes_language_guard(full_text):
                 logger.info(
                     f"Outreach generated [{language}] attempt={attempt} "
-                    f"({len(result)} chars): {result}"
+                    f"3 parts: {[p[:60] for p in parts]}"
                 )
-                return result
-            
+                return parts
+
             logger.warning(
                 f"Outreach attempt {attempt} rejected by language guard "
-                f"(expected {language}): {result[:120]}..."
+                f"(expected {language}): {full_text[:120]}..."
             )
     finally:
         # Outreach sessions are single-use — close the WebSocket immediately so we
@@ -824,13 +890,11 @@ async def _generate_outreach_message_inner(
         _SESSIONS.pop(outreach_key, None)
         await session.reset()
 
-    # Hard fallback if the model keeps violating language/casino constraints.
-    return _ensure_required_outreach_fields(
-        _fallback_outreach(language=language, link_url=link_url, promo_code=promo_code),
-        language=language,
-        link_url=link_url,
-        promo_code=promo_code,
-    )
+    # Hard fallback — use templates if LLM keeps failing
+    if best:
+        # best is a single string, return as 1-element list
+        return [best]
+    return build_outreach_parts(language, link_url, promo_code)
 
 
 async def _download_audio(

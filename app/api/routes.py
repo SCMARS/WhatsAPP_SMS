@@ -187,14 +187,29 @@ async def _resolve_initial_message(
     resolved_lang = _to_elevenlabs_language(language)
     recent_openings = await _recent_opening_keys(db, phone, limit=12)
 
-    # --- Structured 3-part outreach (template-based) ---
-    # Try up to 4 times to pick a greeting that wasn't used recently.
+    # --- LLM-generated 3-part outreach ---
+    # generate_outreach_message now returns list[str] (3 parts).
+    # Try up to 4 times to avoid repeating the same greeting.
     max_attempts = 4
-    for _attempt in range(max_attempts):
-        parts = build_outreach_parts(resolved_lang, link_url or "", promo_code or "")
+    parts: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        candidate = await generate_outreach_message(
+            agent_id=campaign.agent_id,
+            chat_key=f"{phone}:outreach:{attempt}",
+            language=resolved_lang,
+            link_url=link_url or "",
+            promo_code=promo_code or "",
+        )
+        if not candidate:
+            continue
+        parts = candidate
         if _opening_key(parts[0]) not in recent_openings:
             return parts
-    # All greetings collided — return last generated set anyway.
+
+    if not parts:
+        # All LLM attempts failed — use template fallback
+        parts = build_outreach_parts(resolved_lang, link_url or "", promo_code or "")
+
     return parts
 
 
