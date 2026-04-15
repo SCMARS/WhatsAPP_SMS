@@ -10,7 +10,7 @@ COUNTRY_MAP = {
         "name": "Portugal",
         "campaign": "portugal",
         "lang": "pt",
-        "promo": "PROMO_PT",
+        "promo": "50Pragmatic",
     },
     # Argentina
     "54": {

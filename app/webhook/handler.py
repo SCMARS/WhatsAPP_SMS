@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import random
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -10,7 +11,22 @@ from app.db.models import Campaign, Conversation, WhatsAppMessage, Blacklist
 from app.services.blacklist import add_to_blacklist, is_blacklisted, is_stop_message
 from app.services.elevenlabs import generate_text_reply, get_agent_prompt, transcribe_audio
 from app.services.gemini import describe_image
-from app.services.sender import send_message, read_chat
+from app.services.sender import send_message, send_split_message, read_chat
+
+PT_NUDGES = [
+    "🎰",
+    "👆",
+    "Só clicar e já está!",
+    "É só um clique 😉",
+    "Vai lá, não te arrependes 🍀",
+]
+ES_NUDGES = [
+    "🎰",
+    "👆",
+    "¡Solo un clic y listo!",
+    "Dale, no te va a pesar 😉",
+    "Un clic nada más 🍀",
+]
 
 logger = logging.getLogger(__name__)
 _CHAT_LOCKS: dict[str, asyncio.Lock] = {}
@@ -313,78 +329,6 @@ async def _handle_incoming_locked(
     db.add(inbound_msg)
     await db.commit()
 
-    # 8. Ignore if user already replied (Anna logic: only 1 reply total)
-    inbound_res = await db.execute(
-        select(WhatsAppMessage).where(
-            WhatsAppMessage.conversation_id == conversation.id,
-            WhatsAppMessage.direction == "inbound"
-        )
-    )
-    # The current message is already saved, so if count > 1, it's a second/third message.
-    if len(inbound_res.scalars().all()) > 1:
-        logger.info(f"Phone {phone} already replied. Ignoring subsequent messages as per Anna logic.")
-        return
-
-    # 9. Load last few messages for context
-    result = await db.execute(
-        select(WhatsAppMessage)
-        .where(WhatsAppMessage.conversation_id == conversation.id)
-        .order_by(WhatsAppMessage.created_at.desc())
-        .limit(5)
-    )
-    recent_messages = list(reversed(result.scalars().all()))
-    llm_history = [{"role": ("user" if m.direction == "inbound" else "assistant"), "content": m.body} for m in recent_messages]
-
-    # 10. Get Campaign info
-    result = await db.execute(select(Campaign).where(Campaign.id == conversation.campaign_id))
-    campaign = result.scalar_one_or_none()
-    if not campaign:
-        logger.error(f"Campaign not found for conversation {conversation.id}")
-        return
-
-    # 11. Generate reply via ElevenLabs
-    # Look up the real link/promo for this lead so the agent can include them in replies.
-    reply_link = ""
-    reply_promo = ""
-    try:
-        from app.db.models import LinkPool
-        from app.services.country import detect_country
-        lp_res = await db.execute(
-            select(LinkPool).where(
-                LinkPool.lead_id == conversation.lead_id,
-                LinkPool.used == True,
-            ).order_by(LinkPool.id).limit(1)
-        )
-        lp = lp_res.scalar_one_or_none()
-        if lp:
-            reply_link = lp.url or ""
-        country_info = detect_country(conversation.phone)
-        reply_promo = country_info.get("promo") or ""
-    except Exception:
-        pass
-
-    try:
-        reply = await generate_text_reply(
-            agent_id=campaign.agent_id,
-            system_prompt=campaign.agent_prompt,
-            history=llm_history,
-            lead_name=conversation.lead_name,
-            chat_key=conversation.phone,
-            dynamic_variables={"promo": reply_promo, "link": reply_link},
-        )
-    except Exception as e:
-        logger.error(f"ElevenLabs failed: {e}")
-        reply = "Привет! По всем вопросам бонуса тебе лучше всего подскажут в нашем онлайн-чате на сайте. Заглядывай туда! 😉"
-
-    if not reply:
-        reply = "За подробностями по бонусу и условиям заходи к нам в чат поддержки на сайте, там помогут за секунду! ✨"
-
-    # 12. Send reply
-    await send_message(
-        db=db,
-        conversation=conversation,
-        text=reply,
-        lead_name=conversation.lead_name,
-        batch_index=0,
-        is_reply=True,
-    )
+    # 8. No auto-replies — bot only sends the initial outreach.
+    #    Inbound messages are saved (step 7) for analytics but we do NOT respond.
+    logger.info(f"Inbound message from {phone} saved, no auto-reply (outreach-only mode)")
