@@ -31,10 +31,10 @@ _lock = asyncio.Lock()
 # After day 30 the instance's own configured limits apply.
 # ---------------------------------------------------------------------------
 WARMUP_SCHEDULE: list[tuple[int, int, int]] = [
-    (7,  30,   5),   # Week 1: max 30/day,  5/hour
-    (14, 60,  10),   # Week 2: max 60/day, 10/hour
-    (21, 100, 20),   # Week 3: max 100/day, 20/hour
-    (30, 150, 25),   # Week 4: max 150/day, 25/hour
+    (7,  60,   15),  # Week 1: max 60/day,  15/hour (upped from 8)
+    (14, 100,  20),  # Week 2: max 100/day, 20/hour
+    (21, 150,  30),  # Week 3: max 150/day, 30/hour
+    (30, 250,  40),  # Week 4: max 250/day, 40/hour
     # After day 30 → use configured daily_limit / hourly_limit
 ]
 

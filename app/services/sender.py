@@ -1,4 +1,8 @@
+from __future__ import annotations
+import asyncio
 import logging
+import random
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -179,6 +183,124 @@ async def send_message(
     return msg
 
 
+def split_message(ai_message: str, promo: str, link: str) -> tuple[str, str, str]:
+    """Split an AI reply into 3 parts: hook, body, and promo+link.
+
+    Strips the link and promo from the body text so they appear only in part 3.
+    Splits on natural sentence boundaries (.!?\\n). Never cuts mid-sentence.
+    """
+    body = ai_message or ""
+    # Strip link and promo from body so they land exclusively in part 3
+    if link:
+        body = body.replace(link, "")
+    if promo:
+        body = body.replace(promo, "")
+    # Clean up leftover blank lines and whitespace
+    body = re.sub(r"\n{2,}", "\n", body).strip()
+
+    # Split into sentences at . ! ? or newline boundaries
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n", body) if s.strip()]
+    if not sentences:
+        sentences = [body] if body else [""]
+
+    if len(sentences) == 1:
+        part1 = sentences[0]
+        part2 = sentences[0]
+    elif len(sentences) == 2:
+        part1, part2 = sentences[0], sentences[1]
+    else:
+        part1 = sentences[0]
+        part2 = " ".join(sentences[1:])
+
+    # Part 3 — promo code + link (one per line); fall back to repeating part2
+    part3_lines = [x for x in [promo, link] if x]
+    part3 = "\n".join(part3_lines) if part3_lines else part2
+
+    return part1, part2, part3
+
+
+async def send_split_message(
+    db: AsyncSession,
+    conversation: Conversation,
+    ai_message: str,
+    promo: str,
+    link: str,
+    is_cold: bool = False,
+) -> None:
+    """Send an AI reply as 3 separate messages with typing indicators and human-like delays.
+
+    Part 1 = greeting/hook, Part 2 = body, Part 3 = promo + link.
+    Uses shorter inter-part pauses for warm replies and longer ones for cold outreach.
+    Wraps everything in try/except so the webhook always returns 200.
+    """
+    import httpx
+
+    try:
+        instance = await instance_pool.get_best_instance(db)
+        if not instance:
+            logger.error("No available WhatsApp instances for send_split_message")
+            return
+
+        chat_id = _format_phone(conversation.phone)
+        parts = list(split_message(ai_message, promo, link))
+        typing_multiplier = 1.5 if is_cold else 1.0
+        send_status = "failed"
+
+        for i, part in enumerate(parts):
+            if not part:
+                continue
+
+            # 1. Typing indicator
+            typing_secs = max(3.0, min(10.0, len(part) * 0.05)) * typing_multiplier
+            typing_url = build_url(instance.instance_id, instance.api_token, "sendTyping")
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    await client.post(
+                        typing_url,
+                        json={"chatId": chat_id, "typingTime": int(typing_secs)},
+                    )
+            except Exception as e:
+                logger.warning(f"Typing indicator failed for part {i + 1}: {e}")
+
+            # 2. Emulate typing duration
+            await asyncio.sleep(typing_secs)
+
+            # 3. Send the part
+            text_to_send = insert_zero_width(part)
+            provider_id = None
+            error_text = None
+            send_status = "failed"
+            try:
+                provider_id, error_text, send_status = await _do_send(instance, chat_id, text_to_send)
+            except Exception as e:
+                logger.error(f"send_split_message part {i + 1}/3 failed for {conversation.phone}: {e}")
+
+            # 4. Persist to DB
+            msg = WhatsAppMessage(
+                conversation_id=conversation.id,
+                instance_id=instance.id,
+                direction="outbound",
+                body=text_to_send,
+                provider_message_id=provider_id,
+                status=send_status,
+                error=error_text,
+            )
+            db.add(msg)
+            await db.commit()
+            logger.info(f"Sent part {i + 1}/3 to {chat_id} status={send_status}")
+
+            # 5. Inter-part pause (skip after last part)
+            if i < len(parts) - 1:
+                pause = random.uniform(15, 35) if is_cold else random.uniform(8, 20)
+                await asyncio.sleep(pause)
+
+        if send_status in ("sent", "queued"):
+            await instance_pool.record_send(instance.instance_id)
+
+    except Exception as e:
+        logger.error(f"send_split_message unexpected error for {conversation.phone}: {e}")
+
+
 def calc_typing_time(message: str) -> int:
     # Delegates to rate_limiter to keep logic in one place
     from app.services.rate_limiter import calc_typing_time as _calc
@@ -269,6 +391,7 @@ async def send_initial_message(
     conversation: Conversation,
     initial_text: str | list[str],
     batch_index: int = 0,
+    is_cold: bool = True,
 ) -> Optional[WhatsAppMessage]:
     messages = [initial_text] if isinstance(initial_text, str) else initial_text
     last_msg = None
@@ -290,6 +413,10 @@ async def send_initial_message(
         )
         if i == 0:
             last_msg = msg
+            # Record first_contact_at on the first successful cold send
+            if msg and conversation.first_contact_at is None:
+                conversation.first_contact_at = datetime.now(timezone.utc)
+                await db.commit()
             if msg and msg.instance_id:
                 from sqlalchemy import select
                 res = await db.execute(
@@ -304,6 +431,9 @@ async def send_initial_message(
 
         # Wait before the next part of a multi-part message
         if i < len(messages) - 1:
-            await reply_pause(min_sec=8.0, max_sec=16.0)
+            if is_cold:
+                await asyncio.sleep(random.uniform(15, 35))
+            else:
+                await reply_pause(min_sec=8.0, max_sec=16.0)
 
     return last_msg

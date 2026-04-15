@@ -76,6 +76,8 @@ class Conversation(Base):
     platform: Mapped[str] = mapped_column(String(20), default="whatsapp", nullable=False, server_default="whatsapp")
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)  # active|stopped|closed
     is_blacklisted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    nudge_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="false")
+    first_contact_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
