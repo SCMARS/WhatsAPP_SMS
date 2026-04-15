@@ -213,18 +213,80 @@ def _ensure_required_outreach_fields(
 
 
 def _fallback_outreach(language: str, link_url: str, promo_code: Optional[str]) -> str:
+    """Single-string fallback (kept for backward compatibility)."""
+    parts = build_outreach_parts(language, link_url, promo_code)
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Structured outreach templates — exactly 3 WhatsApp messages per lead
+# ---------------------------------------------------------------------------
+
+_PT_GREETINGS = [
+    "Olá! Camila do Oro Casino aqui 🙂 Foi um prazer conversar contigo.",
+    "Olá! Aqui é a Camila do Oro Casino 🙂 Foi um prazer falar contigo.",
+    "Olá! Sou a Camila do Oro Casino 🙂 Que bom falar contigo.",
+    "Olá! Camila do Oro Casino 🙂 Foi mesmo bom conversar contigo.",
+    "Olá! A Camila do Oro Casino aqui 🙂 Gostei de falar contigo.",
+]
+
+_AR_GREETINGS = [
+    "¡Hola! Olivia de Pampas aquí 🙂 Fue un placer charlar con vos.",
+    "¡Hola! Soy Olivia de Pampas 🙂 Fue un gusto hablar con vos.",
+    "¡Hola! Acá Olivia de Pampas 🙂 Qué bueno charlar con vos.",
+    "¡Hola! Olivia de Pampas 🙂 Me encantó hablar con vos.",
+    "¡Hola! Soy Olivia de Pampas Casino 🙂 Fue un placer charlar con vos.",
+]
+
+_PT_OFFERS = [
+    "Como prometi, aqui está o teu código promocional:\n{promo}\n50 Rodadas Grátis no Pragmatic Play · apenas 5 dias\n👉 {link}",
+    "Como prometi, aqui tens o teu código:\n{promo}\n50 Rodadas Grátis na Pragmatic Play · válido 5 dias\n👉 {link}",
+    "Tal como combinado, o teu código promocional:\n{promo}\n50 Rodadas Grátis no Pragmatic Play · só 5 dias\n👉 {link}",
+]
+
+_AR_OFFERS = [
+    "Como te prometí, acá tenés el link de tu bono del 175% en tu próximo depósito desde ARS 5000 · solo 5 días\n👉 {link}",
+    "Como te dije, acá va tu link para el bono del 175% en tu próximo depósito desde ARS 5000 · válido 5 días\n👉 {link}",
+    "Tal como te prometí, tu bono del 175% en tu próximo depósito desde ARS 5000 · solo 5 días\n👉 {link}",
+]
+
+_PT_TRIGGERS = [
+    "O link ficará clicável se enviares qualquer mensagem neste chat (mesmo um emoji) 🙂 Boa sorte 🤞",
+    "Envia qualquer mensagem ou emoji e o link ativa-se na hora. Boa sorte! 🤞",
+    "Responde com qualquer coisa para o link ficar clicável. Boa sorte! 🍀",
+]
+
+_AR_TRIGGERS = [
+    "El link se va a poder clickear si mandás cualquier mensaje en este chat (incluso un emoji) 🙂 ¡Buena suerte! 🤞",
+    "Mandame cualquier mensaje o emoji para activar el link. ¡Buena suerte! 🤞",
+    "Respondé con cualquier cosa y el link queda activo al toque. ¡Mucha suerte! 🍀",
+]
+
+
+def build_outreach_parts(
+    language: str,
+    link_url: str,
+    promo_code: Optional[str] = None,
+) -> list[str]:
+    """
+    Build the 3-part outreach message:
+      Part 1 — Personal greeting with persona name
+      Part 2 — Offer details with promo/link
+      Part 3 — Clickability trigger + good luck
+    Returns a list of 3 strings ready to send as separate WhatsApp messages.
+    """
     promo = promo_code or "50Pragmatic"
+
     if language == "es-AR":
-        return (
-            "¡Hola! Soy Olivia de Pampas 🙂 Fue un placer charlar con vos. "
-            f"Como te prometí, acá tenés el link de tu bono del 175% en tu próximo depósito desde ARS 5000 · solo 5 días 👉 {link_url} "
-            "El link se va a poder clickear si mandás cualquier mensaje en este chat (incluso un emoji) 🙂 ¡Buena suerte! 🤞"
-        )
-    return (
-        f"Olá! Sou a Camila do Oro Casino 🙂 Foi um prazer falar contigo. "
-        f"Como prometi, aqui está o teu código promocional: {promo} — 50 Rodadas Grátis no Pragmatic Play · apenas 5 dias 👉 {link_url} "
-        "O link ficará clicável se enviares qualquer mensagem neste chat (mesmo um emoji) 🙂 Boa sorte 🤞"
-    )
+        part1 = random.choice(_AR_GREETINGS)
+        part2 = random.choice(_AR_OFFERS).format(link=link_url)
+        part3 = random.choice(_AR_TRIGGERS)
+    else:
+        part1 = random.choice(_PT_GREETINGS)
+        part2 = random.choice(_PT_OFFERS).format(promo=promo, link=link_url)
+        part3 = random.choice(_PT_TRIGGERS)
+
+    return [part1, part2, part3]
 
 
 async def _open_socket(

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.models import Campaign, Conversation, WhatsAppInstance, WhatsAppMessage
 from app.db.session import AsyncSessionLocal, get_db
-from app.services.elevenlabs import generate_outreach_message
+from app.services.elevenlabs import build_outreach_parts, generate_outreach_message
 from app.services.green_api import set_anti_ban_settings, get_state_instance
 from app.services import pool as instance_pool
 from app.services.blacklist import is_blacklisted
@@ -187,39 +187,15 @@ async def _resolve_initial_message(
     resolved_lang = _to_elevenlabs_language(language)
     recent_openings = await _recent_opening_keys(db, phone, limit=12)
 
-    message = ""
+    # --- Structured 3-part outreach (template-based) ---
+    # Try up to 4 times to pick a greeting that wasn't used recently.
     max_attempts = 4
-    for attempt in range(1, max_attempts + 1):
-        candidate = await generate_outreach_message(
-            agent_id=campaign.agent_id,
-            chat_key=f"{phone}:outreach:{attempt}",
-            language=resolved_lang,
-            link_url=link_url or "",
-            promo_code=promo_code or "",
-        )
-        if not candidate:
-            continue
-        if _opening_key(candidate) not in recent_openings:
-            message = candidate
-            break
-        # Keep last candidate as fallback if all attempts collide.
-        message = candidate
-
-    if not message:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "ElevenLabs returned empty outreach text. Check your agent prompt and make sure "
-                "it handles dynamic variables {language}, {link}, {promo} and generates text."
-            ),
-        )
-
-    parts = _split_outreach_into_three_random_parts(
-        message,
-        link_url=link_url,
-        promo_code=promo_code,
-    )
-    return parts or [message]
+    for _attempt in range(max_attempts):
+        parts = build_outreach_parts(resolved_lang, link_url or "", promo_code or "")
+        if _opening_key(parts[0]) not in recent_openings:
+            return parts
+    # All greetings collided — return last generated set anyway.
+    return parts
 
 
 # ---------------------------------------------------------------------------
