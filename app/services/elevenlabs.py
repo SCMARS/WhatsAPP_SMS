@@ -115,15 +115,15 @@ def _clickability_trigger(language: str) -> str:
     """Randomized instruction to encourage a reply so the link becomes clickable."""
     if language == "es-AR":
         return random.choice([
-            "¡Podés mandarme un emoji para que el link sea clicable! 👍",
-            "Mandame cualquier emoji para activar el link ahora mismo. 😉",
-            "Respondeme con un emoji y el link se volverá azul y clicable al toque. 🚀",
+            "El link se va a poder clickear si mandás cualquier mensaje en este chat (incluso un emoji) 🙂 ¡Buena suerte! 🤞",
+            "Mandame cualquier mensaje o emoji para activar el link. ¡Buena suerte! 🤞",
+            "Respondé con cualquier cosa y el link queda activo al toque. ¡Mucha suerte! 🍀",
         ])
     # Default: pt-PT
     return random.choice([
-        "Podes responder com um emoji para o link ficar clicável! 👍",
-        "Envia-me um emoji rápido para ativares o link. 😉",
-        "Responde com qualquer emoji para o link ficar azul e clicável. 🚀",
+        "O link ficará clicável se enviares qualquer mensagem neste chat (mesmo um emoji) 🙂 Boa sorte 🤞",
+        "Envia qualquer mensagem ou emoji e o link ativa-se na hora. Boa sorte! 🤞",
+        "Responde com qualquer coisa para o link ficar clicável. Boa sorte! 🍀",
     ])
 
 
@@ -205,25 +205,25 @@ def _ensure_required_outreach_fields(
         if tail:
             result = f"{result} {tail}".strip()
             
-    # Always add the activation trigger at the very end
-    trigger = _clickability_trigger(language)
-    return f"{result} {trigger}".strip() if result else trigger
+    # Only add the activation trigger if ElevenLabs didn't already include one
+    if result and "emoji" not in result.lower():
+        trigger = _clickability_trigger(language)
+        result = f"{result} {trigger}".strip()
+    return result or _clickability_trigger(language)
 
 
 def _fallback_outreach(language: str, link_url: str, promo_code: Optional[str]) -> str:
-    promo = promo_code or "BONUS50"
+    promo = promo_code or "50Pragmatic"
     if language == "es-AR":
         return (
-            "Hola! Soy Olivia de Pampas Casino. "
-            "Tenes un bono del 175% en tu proximo deposito desde ARS 5000 (valido 5 dias). "
-            f"Responde a este mensaje para activar el link: {link_url}. "
-            "Mucha suerte!"
+            "¡Hola! Soy Olivia de Pampas 🙂 Fue un placer charlar con vos. "
+            f"Como te prometí, acá tenés el link de tu bono del 175% en tu próximo depósito desde ARS 5000 · solo 5 días 👉 {link_url} "
+            "El link se va a poder clickear si mandás cualquier mensaje en este chat (incluso un emoji) 🙂 ¡Buena suerte! 🤞"
         )
     return (
-        "Ola! Sou a Camila do Oro Casino. "
-        f"Tens 50 Rodadas Gratis com o codigo {promo}. "
-        f"Responde a esta mensagem para ativar o link: {link_url}. "
-        "Boa sorte!"
+        f"Olá! Sou a Camila do Oro Casino 🙂 Foi um prazer falar contigo. "
+        f"Como prometi, aqui está o teu código promocional: {promo} — 50 Rodadas Grátis no Pragmatic Play · apenas 5 dias 👉 {link_url} "
+        "O link ficará clicável se enviares qualquer mensagem neste chat (mesmo um emoji) 🙂 Boa sorte 🤞"
     )
 
 
