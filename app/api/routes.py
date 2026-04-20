@@ -180,9 +180,8 @@ async def _resolve_initial_message(
     link_url: Optional[str] = None,
     promo_code: Optional[str] = None,
 ) -> list[str]:
-    # Caller-supplied message takes priority (manual override).
-    if provided:
-        return [provided] if isinstance(provided, str) else list(provided)
+    # NOTE: Ignore caller-supplied message to ensure dynamic variables are ALWAYS substituted.
+    # This prevents stale messages with {promo}/{link} placeholders from being sent.
 
     resolved_lang = _to_elevenlabs_language(language)
     recent_openings = await _recent_opening_keys(db, phone, limit=12)
