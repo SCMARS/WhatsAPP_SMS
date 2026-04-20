@@ -190,6 +190,12 @@ def split_message(ai_message: str, promo: str, link: str) -> tuple[str, str, str
     Splits on natural sentence boundaries (.!?\\n). Never cuts mid-sentence.
     """
     body = ai_message or ""
+    # First, replace placeholders with actual values if they exist
+    if promo:
+        body = body.replace("{promo}", promo)
+    if link:
+        body = body.replace("{link}", link)
+
     # Strip link and promo from body so they land exclusively in part 3
     if link:
         body = body.replace(link, "")

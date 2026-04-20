@@ -280,7 +280,7 @@ async def _handle_locked(event, inst: TelegramInstance, sender, telegram_user_id
                 history=llm_history,
                 lead_name=conversation.lead_name,
                 chat_key=conversation.phone,
-                dynamic_variables={"promo": "", "link": ""},
+                dynamic_variables={},
             )
         except Exception as e:
             logger.error(f"[TGIncoming] ElevenLabs failed: {e}")
