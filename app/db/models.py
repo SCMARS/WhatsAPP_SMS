@@ -81,6 +81,16 @@ class Conversation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    # ── Lead conversion tracking ──────────────────────────────────────────────
+    # lead_status: new → contacted → replied → interested → converted | unsubscribed
+    lead_status: Mapped[str] = mapped_column(String(30), default="new", nullable=False, server_default="new")
+    outbound_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    reply_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    replied_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    assigned_link_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     campaign: Mapped["Campaign"] = relationship("Campaign", back_populates="conversations")
     messages: Mapped[List["WhatsAppMessage"]] = relationship(
         "WhatsAppMessage",
@@ -91,6 +101,11 @@ class Conversation(Base):
         "TelegramMessage",
         back_populates="conversation",
         order_by="TelegramMessage.created_at"
+    )
+    events: Mapped[List["LeadEvent"]] = relationship(
+        "LeadEvent",
+        back_populates="conversation",
+        order_by="LeadEvent.created_at"
     )
 
 
@@ -219,3 +234,31 @@ class TelegramMessage(Base):
 
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="telegram_messages")
     instance: Mapped[Optional["TelegramInstance"]] = relationship("TelegramInstance", back_populates="messages")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEAD CONVERSION TRACKING
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LeadEvent(Base):
+    """Timeline of key events for a lead conversation (conversion funnel tracking)."""
+    __tablename__ = "lead_events"
+    __table_args__ = (
+        Index("ix_lead_events_conversation_created", "conversation_id", "created_at"),
+        Index("ix_lead_events_event_type", "event_type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False
+    )
+    # contacted | replied | nudge_sent | link_clicked | converted | unsubscribed
+    # note_added | followup_sent | status_changed
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="events")

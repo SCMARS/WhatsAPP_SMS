@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Leads Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d26; --surface2: #222536;
+    --border: #2e3347; --text: #e2e8f0; --muted: #8892a4;
+    --accent: #6366f1; --accent2: #22d3ee;
+    --green: #22c55e; --yellow: #f59e0b; --red: #ef4444; --purple: #a855f7;
+    --blue: #3b82f6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; min-height: 100vh; }
+
+  /* ── Header ── */
+  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+  .header h1 span { color: var(--accent); }
+  .btn { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .btn:hover { opacity: 0.88; }
+  .btn.sm { padding: 4px 10px; font-size: 12px; }
+  .btn.outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  .btn.danger { background: var(--red); }
+  .btn.success { background: var(--green); }
+
+  /* ── Stats bar ── */
+  .stats { display: flex; gap: 12px; padding: 16px 24px; flex-wrap: wrap; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; flex: 1; min-width: 130px; }
+  .stat-card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 6px; }
+  .stat-card .value { font-size: 26px; font-weight: 700; }
+  .stat-card .sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .c-green { color: var(--green); } .c-yellow { color: var(--yellow); }
+  .c-red { color: var(--red); } .c-purple { color: var(--purple); }
+  .c-blue { color: var(--blue); } .c-accent { color: var(--accent); }
+
+  /* ── Filters ── */
+  .filters { display: flex; gap: 10px; padding: 0 24px 14px; flex-wrap: wrap; align-items: center; }
+  .filters select, .filters input[type=text] {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+  .filters select option { background: var(--surface2); }
+  .filters label { color: var(--muted); font-size: 12px; }
+
+  /* ── Table ── */
+  .table-wrap { padding: 0 24px 24px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th { background: var(--surface2); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; padding: 10px 12px; text-align: left; position: sticky; top: 0; z-index: 1; }
+  tbody tr { border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.1s; }
+  tbody tr:hover { background: var(--surface); }
+  tbody td { padding: 10px 12px; font-size: 13px; vertical-align: middle; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge-new { background: #1e293b; color: #94a3b8; }
+  .badge-contacted { background: #1e3a5f; color: #60a5fa; }
+  .badge-replied { background: #14532d; color: #4ade80; }
+  .badge-interested { background: #3b1f6e; color: #c084fc; }
+  .badge-converted { background: #064e3b; color: #34d399; }
+  .badge-unsubscribed { background: #451a1a; color: #f87171; }
+  .mono { font-family: 'SF Mono', monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+
+  /* ── Pagination ── */
+  .pagination { display: flex; gap: 8px; justify-content: center; padding: 16px; align-items: center; }
+  .pagination span { color: var(--muted); font-size: 13px; }
+
+  /* ── Slide-out panel ── */
+  .panel-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100; }
+  .panel-overlay.open { display: block; }
+  .panel { position: fixed; right: 0; top: 0; bottom: 0; width: min(700px, 100vw); background: var(--surface); border-left: 1px solid var(--border); overflow-y: auto; z-index: 101; transform: translateX(100%); transition: transform 0.25s ease; }
+  .panel.open { transform: translateX(0); }
+  .panel-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: flex-start; position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  .panel-header h2 { font-size: 15px; font-weight: 700; }
+  .panel-meta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+  .panel-meta span { font-size: 12px; color: var(--muted); }
+  .panel-body { padding: 16px 20px; }
+  .close-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 20px; line-height: 1; padding: 2px; }
+  .close-btn:hover { color: var(--text); }
+
+  /* ── Conversation ── */
+  .msg-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 13px; line-height: 1.5; }
+  .msg.out { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.in { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 4px; }
+  .msg .msg-time { font-size: 10px; opacity: 0.65; margin-top: 4px; text-align: right; }
+  .msg .msg-status { font-size: 10px; opacity: 0.65; }
+  .msg.failed { opacity: 0.6; border: 1px solid var(--red); }
+  .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin: 16px 0 8px; font-weight: 600; }
+
+  /* ── Events ── */
+  .event-list { display: flex; flex-direction: column; gap: 6px; }
+  .event { display: flex; gap: 10px; font-size: 12px; align-items: flex-start; }
+  .event-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); margin-top: 3px; flex-shrink: 0; }
+  .event-dot.replied { background: var(--green); }
+  .event-dot.converted { background: var(--yellow); }
+  .event-dot.unsubscribed { background: var(--red); }
+  .event-dot.note_added { background: var(--muted); }
+  .event-info { flex: 1; }
+  .event-type { font-weight: 600; text-transform: capitalize; }
+  .event-note { color: var(--muted); }
+  .event-time { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+  /* ── Note/Status forms ── */
+  .action-row { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: flex-start; }
+  .action-row textarea { flex: 1; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 10px; font-size: 13px; resize: vertical; min-height: 56px; font-family: inherit; }
+  .action-row select { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+
+
+  /* ── Funnel bar ── */
+  .funnel { display: flex; gap: 6px; padding: 0 24px 16px; flex-wrap: wrap; }
+  .funnel-bar { flex: 1; min-width: 80px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; text-align: center; }
+  .funnel-bar .f-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin-bottom: 4px; }
+  .funnel-bar .f-count { font-size: 22px; font-weight: 700; }
+
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading { display: flex; align-items: center; gap: 8px; padding: 40px; justify-content: center; color: var(--muted); }
+  .empty { text-align: center; padding: 40px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Header -->
+  <div class="header">
+    <h1>Leads <span>Dashboard</span></h1>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="btn sm outline" onclick="exportCsv()">Export CSV</button>
+      <button class="btn sm outline" onclick="loadLeads(true);loadStats();loadFunnel()">↺ Refresh</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats" id="statsBar">
+    <div class="stat-card"><div class="label">Total Leads</div><div class="value" id="s-total">—</div></div>
+    <div class="stat-card"><div class="label">Contacted</div><div class="value c-blue" id="s-contacted">—</div></div>
+    <div class="stat-card"><div class="label">Replied</div><div class="value c-green" id="s-replied">—</div></div>
+    <div class="stat-card"><div class="label">Interested</div><div class="value c-purple" id="s-interested">—</div></div>
+    <div class="stat-card"><div class="label">Converted</div><div class="value c-yellow" id="s-converted">—</div></div>
+    <div class="stat-card"><div class="label">Reply Rate</div><div class="value c-accent" id="s-reply-rate">—</div><div class="sub" id="s-conv-rate">conv —</div></div>
+    <div class="stat-card"><div class="label">Msgs Sent</div><div class="value" id="s-sent">—</div><div class="sub" id="s-recv">recv —</div></div>
+  </div>
+
+  <!-- Funnel -->
+  <div class="funnel" id="funnelBar"></div>
+
+  <!-- Filters -->
+  <div class="filters">
+    <input type="text" id="searchInput" placeholder="Search phone or name…" style="width:220px" oninput="debounceLoad()"/>
+    <select id="filterStatus" onchange="loadLeads(true)">
+      <option value="">All statuses</option>
+      <option value="new">New</option>
+      <option value="contacted">Contacted</option>
+      <option value="replied">Replied</option>
+      <option value="interested">Interested</option>
+      <option value="converted">Converted</option>
+      <option value="unsubscribed">Unsubscribed</option>
+    </select>
+    <select id="filterPlatform" onchange="loadLeads(true)">
+      <option value="">All platforms</option>
+      <option value="whatsapp">WhatsApp</option>
+      <option value="telegram">Telegram</option>
+    </select>
+    <select id="filterCampaign" onchange="loadLeads(true)">
+      <option value="">All campaigns</option>
+      <option value="portugal">Portugal</option>
+      <option value="argentina">Argentina</option>
+    </select>
+    <button class="btn sm outline" onclick="loadLeads(true); loadStats();">Refresh</button>
+  </div>
+
+  <!-- Table -->
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Phone</th>
+          <th>Name</th>
+          <th>Platform</th>
+          <th>Campaign</th>
+          <th>Status</th>
+          <th>Sent</th>
+          <th>Replies</th>
+          <th>First Contact</th>
+          <th>Last Activity</th>
+          <th>Link</th>
+        </tr>
+      </thead>
+      <tbody id="leadsBody"></tbody>
+    </table>
+    <div id="tableLoading" class="loading"><div class="spinner"></div> Loading…</div>
+    <div id="tableEmpty" class="empty" style="display:none">No leads found</div>
+  </div>
+
+  <!-- Pagination -->
+  <div class="pagination" id="pagination"></div>
+
+</div>
+
+<!-- Slide-out conversation panel -->
+<div class="panel-overlay" id="panelOverlay" onclick="closePanel()"></div>
+<div class="panel" id="panel">
+  <div class="panel-header">
+    <div>
+      <h2 id="panelTitle">Conversation</h2>
+      <div class="panel-meta" id="panelMeta"></div>
+    </div>
+    <button class="close-btn" onclick="closePanel()">×</button>
+  </div>
+  <div class="panel-body" id="panelBody">
+    <div class="loading"><div class="spinner"></div> Loading…</div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let API_KEY = '';
+let currentOffset = 0;
+const PAGE_SIZE = 100;
+let totalLeads = 0;
+let debounceTimer = null;
+let _panelPhone = '';
+let _panelPlatform = '';
+
+// ── Init — fetch key automatically, no login needed ────────────────────────
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const cfg = await fetch('/dashboard/config').then(r => r.json());
+    API_KEY = cfg.api_key || '';
+  } catch(e) {
+    console.error('Could not load dashboard config', e);
+  }
+  loadStats();
+  loadLeads(true);
+  loadFunnel();
+});
+
+function debounceLoad() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => loadLeads(true), 400);
+}
+
+// ── API helper ─────────────────────────────────────────────────────────────
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { 'x-api-key': API_KEY, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    const d = await api('/api/analytics/overview');
+    document.getElementById('s-total').textContent = fmt(d.total_leads);
+    document.getElementById('s-contacted').textContent = fmt(d.contacted);
+    document.getElementById('s-replied').textContent = fmt(d.replied);
+    document.getElementById('s-interested').textContent = fmt(d.interested);
+    document.getElementById('s-converted').textContent = fmt(d.converted);
+    document.getElementById('s-reply-rate').textContent = d.reply_rate_pct + '%';
+    document.getElementById('s-conv-rate').textContent = 'conv ' + d.conversion_rate_pct + '%';
+    document.getElementById('s-sent').textContent = fmt(d.total_messages_sent);
+    document.getElementById('s-recv').textContent = 'recv ' + fmt(d.total_messages_received);
+  } catch(e) { console.error('stats', e); }
+}
+
+// ── Funnel ─────────────────────────────────────────────────────────────────
+async function loadFunnel() {
+  try {
+    const d = await api('/api/analytics/funnel');
+    const colors = { new:'#94a3b8', contacted:'#60a5fa', replied:'#4ade80', interested:'#c084fc', converted:'#fbbf24', unsubscribed:'#f87171' };
+    document.getElementById('funnelBar').innerHTML = d.funnel
+      .filter(f => f.count > 0 || ['new','contacted','replied','converted'].includes(f.stage))
+      .map(f => `<div class="funnel-bar"><div class="f-label">${f.stage}</div><div class="f-count" style="color:${colors[f.stage]||'#e2e8f0'}">${f.count}</div></div>`)
+      .join('');
+  } catch(e) { console.error('funnel', e); }
+}
+
+// ── Leads table ────────────────────────────────────────────────────────────
+async function loadLeads(reset = false) {
+  if (reset) currentOffset = 0;
+  document.getElementById('tableLoading').style.display = 'flex';
+  document.getElementById('tableEmpty').style.display = 'none';
+  document.getElementById('leadsBody').innerHTML = '';
+
+  const params = new URLSearchParams({
+    limit: PAGE_SIZE,
+    offset: currentOffset,
+  });
+  const search = document.getElementById('searchInput').value.trim();
+  const st = document.getElementById('filterStatus').value;
+  const pl = document.getElementById('filterPlatform').value;
+  const ca = document.getElementById('filterCampaign').value;
+  if (search) params.set('search', search);
+  if (st) params.set('lead_status', st);
+  if (pl) params.set('platform', pl);
+  if (ca) params.set('campaign', ca);
+
+  try {
+    const d = await api('/api/leads?' + params);
+    totalLeads = d.total;
+    renderLeads(d.leads);
+    renderPagination();
+  } catch(e) {
+    console.error('leads', e);
+  } finally {
+    document.getElementById('tableLoading').style.display = 'none';
+  }
+}
+
+function renderLeads(leads) {
+  const tbody = document.getElementById('leadsBody');
+  if (!leads.length) {
+    document.getElementById('tableEmpty').style.display = 'block';
+    return;
+  }
+  tbody.innerHTML = leads.map(l => `
+    <tr onclick="openPanel('${esc(l.phone)}', '${esc(l.platform)}')">
+      <td class="mono">${esc(l.phone)}</td>
+      <td>${l.lead_name ? esc(l.lead_name) : '<span class="muted">—</span>'}</td>
+      <td>${platformIcon(l.platform)} ${l.platform}</td>
+      <td>${esc(l.campaign || '')}</td>
+      <td>${statusBadge(l.lead_status)}</td>
+      <td>${l.outbound_count}</td>
+      <td>${l.reply_count > 0 ? `<span class="c-green">${l.reply_count}</span>` : '0'}</td>
+      <td class="muted">${fmtDate(l.first_contact_at)}</td>
+      <td class="muted">${fmtDate(l.last_activity_at)}</td>
+      <td>${l.assigned_link_url ? `<a href="${esc(l.assigned_link_url)}" target="_blank" onclick="event.stopPropagation()" style="color:var(--accent2);font-size:11px">🔗 link</a>` : '<span class="muted">—</span>'}</td>
+    </tr>
+  `).join('');
+}
+
+function renderPagination() {
+  const total = totalLeads;
+  const pages = Math.ceil(total / PAGE_SIZE);
+  const cur = Math.floor(currentOffset / PAGE_SIZE) + 1;
+  const pg = document.getElementById('pagination');
+  if (pages <= 1) { pg.innerHTML = `<span>${total} leads</span>`; return; }
+  pg.innerHTML = `
+    <button class="btn sm outline" onclick="changePage(-1)" ${cur===1?'disabled':''}>← Prev</button>
+    <span>Page ${cur} of ${pages} (${total} total)</span>
+    <button class="btn sm outline" onclick="changePage(1)" ${cur===pages?'disabled':''}>Next →</button>
+  `;
+}
+
+function changePage(dir) {
+  currentOffset = Math.max(0, currentOffset + dir * PAGE_SIZE);
+  loadLeads(false);
+}
+
+// ── Conversation panel ──────────────────────────────────────────────────────
+async function openPanel(phone, platform) {
+  _panelPhone = phone;
+  _panelPlatform = platform || '';
+  document.getElementById('panel').classList.add('open');
+  document.getElementById('panelOverlay').classList.add('open');
+  document.getElementById('panelTitle').textContent = phone;
+  document.getElementById('panelMeta').innerHTML = '';
+  document.getElementById('panelBody').innerHTML = '<div class="loading"><div class="spinner"></div> Loading…</div>';
+
+  try {
+    const params = platform ? `?platform=${encodeURIComponent(platform)}` : '';
+    const d = await api(`/api/leads/${encodeURIComponent(phone)}/conversation${params}`);
+    renderPanel(d.conversations, phone);
+  } catch(e) {
+    document.getElementById('panelBody').innerHTML = `<div class="empty">Error loading conversation</div>`;
+  }
+}
+
+function closePanel() {
+  document.getElementById('panel').classList.remove('open');
+  document.getElementById('panelOverlay').classList.remove('open');
+}
+
+function renderPanel(convs, phone) {
+  if (!convs.length) {
+    document.getElementById('panelBody').innerHTML = '<div class="empty">No data</div>';
+    return;
+  }
+  const c = convs[0];
+  document.getElementById('panelTitle').textContent = (c.lead_name || '') + ' ' + c.phone;
+  document.getElementById('panelMeta').innerHTML = `
+    <span>${platformIcon(c.platform)} ${c.platform}</span>
+    <span>${statusBadge(c.lead_status)}</span>
+    <span>📤 ${c.outbound_count} sent</span>
+    <span>💬 ${c.reply_count} replies</span>
+    ${c.assigned_link_url ? `<span><a href="${esc(c.assigned_link_url)}" target="_blank" style="color:var(--accent2)">🔗 affiliate link</a></span>` : ''}
+    ${c.notes ? `<span title="${esc(c.notes)}">📝 has notes</span>` : ''}
+  `;
+
+  let html = '';
+
+  // Status changer
+  html += `<div class="section-title">Quick Actions</div>
+  <div class="action-row">
+    <select id="statusSelect">
+      ${['new','contacted','replied','interested','converted','unsubscribed'].map(s => `<option value="${s}" ${s===c.lead_status?'selected':''}>${s}</option>`).join('')}
+    </select>
+    <button class="btn sm" onclick="updateStatus('${esc(phone)}')">Update status</button>
+    <button class="btn sm success" onclick="markConverted('${esc(phone)}')">✓ Mark Converted</button>
+  </div>
+  <div class="action-row">
+    <textarea id="noteInput" placeholder="Add a note…"></textarea>
+    <button class="btn sm outline" onclick="addNote('${esc(phone)}')">Add Note</button>
+  </div>`;
+
+  // Messages
+  html += `<div class="section-title">Messages (${c.messages.length})</div><div class="msg-list">`;
+  if (!c.messages.length) {
+    html += '<div class="muted" style="font-size:12px">No messages yet</div>';
+  }
+  for (const m of c.messages) {
+    const isOut = m.direction === 'outbound';
+    const failed = m.status === 'failed';
+    const body = esc(m.body || '');
+    html += `<div class="msg ${isOut ? 'out' : 'in'} ${failed ? 'failed' : ''}">
+      ${body.replace(/\n/g,'<br>')}
+      <div class="msg-time">${fmtDateFull(m.created_at)} ${m.status ? `· ${m.status}` : ''} ${m.error ? `<span style="color:var(--red)">⚠ ${esc(m.error)}</span>` : ''}</div>
+    </div>`;
+  }
+  html += '</div>';
+
+  // Events
+  if (c.events.length) {
+    html += `<div class="section-title">Event Timeline</div><div class="event-list">`;
+    for (const e of c.events) {
+      html += `<div class="event">
+        <div class="event-dot ${e.event_type}"></div>
+        <div class="event-info">
+          <span class="event-type">${esc(e.event_type)}</span>
+          ${e.note ? `<span class="event-note"> — ${esc(e.note)}</span>` : ''}
+        </div>
+        <div class="event-time">${fmtDateFull(e.created_at)}</div>
+      </div>`;
+    }
+    html += '</div>';
+  }
+
+  // Notes
+  if (c.notes) {
+    html += `<div class="section-title">Notes</div>
+    <div style="background:var(--surface2);border-radius:8px;padding:12px;font-size:13px;white-space:pre-wrap;color:var(--text)">${esc(c.notes)}</div>`;
+  }
+
+  document.getElementById('panelBody').innerHTML = html;
+}
+
+async function updateStatus(phone) {
+  const s = document.getElementById('statusSelect').value;
+  try {
+    await api(`/api/leads/${encodeURIComponent(phone)}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ lead_status: s }),
+    });
+    loadLeads(false); loadStats(); loadFunnel();
+    openPanel(_panelPhone, _panelPlatform);
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function markConverted(phone) {
+  try {
+    await api(`/api/leads/${encodeURIComponent(phone)}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ lead_status: 'converted' }),
+    });
+    await api(`/api/leads/${encodeURIComponent(phone)}/event`, {
+      method: 'POST',
+      body: JSON.stringify({ event_type: 'converted', note: 'Manually marked' }),
+    });
+    loadLeads(false); loadStats(); loadFunnel();
+    openPanel(_panelPhone, _panelPlatform);
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function addNote(phone) {
+  const note = (document.getElementById('noteInput') || {}).value || '';
+  if (!note.trim()) return;
+  try {
+    await api(`/api/leads/${encodeURIComponent(phone)}/note`, {
+      method: 'POST',
+      body: JSON.stringify({ note: note.trim() }),
+    });
+    document.getElementById('noteInput').value = '';
+    openPanel(_panelPhone, _panelPlatform);
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function exportCsv() {
+  const params = new URLSearchParams();
+  const st = document.getElementById('filterStatus').value;
+  const pl = document.getElementById('filterPlatform').value;
+  const ca = document.getElementById('filterCampaign').value;
+  if (st) params.set('lead_status', st);
+  if (pl) params.set('platform', pl);
+  if (ca) params.set('campaign', ca);
+
+  const res = await fetch('/api/leads/export.csv?' + params, { headers: { 'x-api-key': API_KEY } });
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `leads_${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s || '')
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function fmt(n) { return n == null ? '—' : Number(n).toLocaleString(); }
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-GB', { day:'2-digit', month:'short' }) + ' ' +
+         d.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
+}
+function fmtDateFull(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'2-digit' }) + ' ' +
+         d.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
+}
+function statusBadge(s) {
+  return `<span class="badge badge-${s||'new'}">${s||'new'}</span>`;
+}
+function platformIcon(p) {
+  return p === 'telegram' ? '✈' : '📱';
+}
+</script>
+</body>
+</html>

@@ -398,12 +398,18 @@ async def send_message_endpoint(
             phone=req.phone,
             lead_name=req.lead_name,
             status="active",
+            assigned_link_url=link_url,
         )
         db.add(conversation)
         await db.commit()
         await db.refresh(conversation)
     elif conversation.status == "stopped":
         return {"status": "skipped"}
+    else:
+        # Update link if not set yet (re-send scenario)
+        if not conversation.assigned_link_url and link_url:
+            conversation.assigned_link_url = link_url
+            await db.commit()
 
     # 6. Build initial message
     initial_text = await _resolve_initial_message(
@@ -517,10 +523,11 @@ async def bulk_send_endpoint(
         if conversation is None:
             conversation = Conversation(
                 campaign_id=campaign.id,
-                lead_id=lead.lead_id,
+                lead_id=lead.lead_id or lead.phone,
                 phone=lead.phone,
                 lead_name=lead.lead_name,
                 status="active",
+                assigned_link_url=link_url,
             )
             db.add(conversation)
             await db.commit()
@@ -528,6 +535,10 @@ async def bulk_send_endpoint(
         elif conversation.status == "stopped":
             results.append({"phone": lead.phone, "status": "skipped"})
             continue
+        else:
+            if not conversation.assigned_link_url and link_url:
+                conversation.assigned_link_url = link_url
+                await db.commit()
 
         # Determine country and link
         country_info = detect_country(lead.phone)

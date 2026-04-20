@@ -23,11 +23,12 @@ import asyncio
 import logging
 from typing import Optional
 
-from sqlalchemy import select, update
+from datetime import datetime, timezone
+from sqlalchemy import func, select, update
 from telethon import events, TelegramClient
 
 from app.db.models import (
-    Blacklist, Campaign, Conversation, TelegramInstance, TelegramMessage,
+    Blacklist, Campaign, Conversation, LeadEvent, TelegramInstance, TelegramMessage,
 )
 from app.db.session import AsyncSessionLocal
 from app.services.blacklist import add_to_blacklist, is_blacklisted, is_stop_message
@@ -148,23 +149,35 @@ async def _handle_locked(event, inst: TelegramInstance, sender, telegram_user_id
             if phone:
                 await add_to_blacklist(db, phone, reason="STOP request")
                 logger.info(f"[TGIncoming] {phone} sent STOP — blacklisted")
-                # Send one-time confirmation
-                if conversation:
-                    from app.services.telegram.sender import send_tg_message
-                    await send_tg_message(
-                        db=db,
-                        conversation=conversation,
-                        text="Вас успішно відписано від розсилки. Більше ми вам не пишемо.",
-                        batch_index=0,
-                        is_reply=True,
-                    )
+            if conversation:
+                conversation.lead_status = "unsubscribed"
+                conversation.is_blacklisted = True
+                conversation.last_activity_at = datetime.now(timezone.utc)
+                db.add(LeadEvent(
+                    conversation_id=conversation.id,
+                    event_type="unsubscribed",
+                    note="STOP message received via Telegram",
+                ))
+                db.add(conversation)
+                await db.commit()
+                from app.services.telegram.sender import send_tg_message
+                await send_tg_message(
+                    db=db,
+                    conversation=conversation,
+                    text="Вас успішно відписано від розсилки. Більше ми вам не пишемо.",
+                    batch_index=0,
+                    is_reply=True,
+                )
             return
 
         # 5. Find / auto-create active Conversation (platform='telegram')
         if conversation is None and phone:
+            # Build phone variants (with/without '+') for robust lookup
+            _digits = "".join(c for c in phone if c.isdigit())
+            _phone_variants = list({phone, _digits, f"+{_digits}"} - {""})
             conv_res = await db.execute(
                 select(Conversation).where(
-                    Conversation.phone.in_([phone]),
+                    Conversation.phone.in_(_phone_variants),
                     Conversation.platform == "telegram",
                     Conversation.status == "active",
                 ).order_by(Conversation.created_at.desc()).limit(1)
@@ -207,14 +220,32 @@ async def _handle_locked(event, inst: TelegramInstance, sender, telegram_user_id
         db.add(inbound_msg)
         await db.commit()
 
+        # 6a. Update reply tracking (refresh first — object may be expired after commit)
+        await db.refresh(conversation)
+        now_utc = datetime.now(timezone.utc)
+        is_first_reply = conversation.replied_at is None
+        conversation.reply_count = (conversation.reply_count or 0) + 1
+        conversation.last_activity_at = now_utc
+        if is_first_reply:
+            conversation.replied_at = now_utc
+            if conversation.lead_status in ("new", "contacted", None):
+                conversation.lead_status = "replied"
+                db.add(LeadEvent(
+                    conversation_id=conversation.id,
+                    event_type="replied",
+                    note=f"First Telegram reply: {(text or '')[:120]}",
+                ))
+        db.add(conversation)
+        await db.commit()
+
         # 7. "Anna logic" — only reply to the FIRST inbound message per conversation
-        inbound_count_res = await db.execute(
-            select(TelegramMessage).where(
+        inbound_count = (await db.execute(
+            select(func.count()).where(
                 TelegramMessage.conversation_id == conversation.id,
                 TelegramMessage.direction == "inbound",
             )
-        )
-        if len(inbound_count_res.scalars().all()) > 1:
+        )).scalar_one()
+        if inbound_count > 1:
             logger.info(f"[TGIncoming] {phone} already replied before — skipping AI reply")
             return
 

@@ -397,6 +397,26 @@ async def send_initial_tg_message(
                 )
                 selected_instance = res.scalar_one_or_none()
 
+        # Track outbound funnel stats (mirrors sender.py logic for WhatsApp)
+        if msg and msg.status in ("sent", "queued"):
+            await db.refresh(conversation)
+            now_utc = datetime.now(timezone.utc)
+            conversation.outbound_count = (conversation.outbound_count or 0) + 1
+            conversation.last_activity_at = now_utc
+            if conversation.first_contact_at is None and i == 0:
+                conversation.first_contact_at = now_utc
+            if conversation.lead_status in ("new", None):
+                conversation.lead_status = "contacted"
+                if i == 0:
+                    from app.db.models import LeadEvent
+                    db.add(LeadEvent(
+                        conversation_id=conversation.id,
+                        event_type="contacted",
+                        note="Initial Telegram outreach sent",
+                    ))
+            db.add(conversation)
+            await db.commit()
+
         if i < len(messages) - 1:
             await reply_pause(min_sec=3.0, max_sec=6.0)
 

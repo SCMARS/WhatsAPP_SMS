@@ -256,16 +256,17 @@ async def _handle_incoming_locked(
             logger.info(f"Duplicate inbound message {provider_message_id}, skipping")
             return
 
-    # 4. Blacklist check
-    if await is_blacklisted(db, phone):
-        logger.info(f"Message from blacklisted phone {phone}, ignoring")
-        return
+    # 4. Blacklist check (try all phone variants — DB may store with or without '+')
+    for _variant in phone_variants:
+        if await is_blacklisted(db, _variant):
+            logger.info(f"Message from blacklisted phone {phone} (matched variant={_variant}), ignoring")
+            return
 
     # 5. STOP check
     if is_stop_message(text):
         await add_to_blacklist(db, phone, reason="STOP request")
         logger.info(f"Phone {phone} sent STOP, added to blacklist")
-        # Send one-time unsubscribe confirmation (conversation may already be closed)
+        # Send one-time unsubscribe confirmation and update lead_status
         conf_res = await db.execute(
             select(Conversation)
             .where(Conversation.phone.in_(list(phone_variants)))
@@ -274,6 +275,16 @@ async def _handle_incoming_locked(
         )
         conf_conv = conf_res.scalar_one_or_none()
         if conf_conv:
+            conf_conv.lead_status = "unsubscribed"
+            conf_conv.is_blacklisted = True
+            from app.db.models import LeadEvent
+            db.add(LeadEvent(
+                conversation_id=conf_conv.id,
+                event_type="unsubscribed",
+                note="STOP message received",
+            ))
+            db.add(conf_conv)
+            await db.commit()
             await send_message(
                 db=db,
                 conversation=conf_conv,
@@ -329,6 +340,28 @@ async def _handle_incoming_locked(
     db.add(inbound_msg)
     await db.commit()
 
+    # 7a. Update lead conversion tracking
+    # Refresh to get latest DB state (object was expired after the previous commit)
+    await db.refresh(conversation)
+    from datetime import datetime, timezone as _tz
+    now_utc = datetime.now(_tz.utc)
+    is_first_reply = conversation.replied_at is None
+    conversation.reply_count = (conversation.reply_count or 0) + 1
+    conversation.last_activity_at = now_utc
+    if is_first_reply:
+        conversation.replied_at = now_utc
+        # Advance lead_status to 'replied' if not already further along
+        if conversation.lead_status in ("new", "contacted", None):
+            conversation.lead_status = "replied"
+            from app.db.models import LeadEvent
+            db.add(LeadEvent(
+                conversation_id=conversation.id,
+                event_type="replied",
+                note=f"First reply: {text[:120]}",
+            ))
+    db.add(conversation)
+    await db.commit()
+
     # 8. No auto-replies — bot only sends the initial outreach.
     #    Inbound messages are saved (step 7) for analytics but we do NOT respond.
-    logger.info(f"Inbound message from {phone} saved, no auto-reply (outreach-only mode)")
+    logger.info(f"Inbound message from {phone} saved (reply_count={conversation.reply_count}), no auto-reply (outreach-only mode)")

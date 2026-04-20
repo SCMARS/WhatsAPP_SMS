@@ -417,6 +417,26 @@ async def send_initial_message(
             if msg and conversation.first_contact_at is None:
                 conversation.first_contact_at = datetime.now(timezone.utc)
                 await db.commit()
+
+        # Track outbound stats for conversion funnel
+        if msg and msg.status in ("sent", "queued"):
+            # Refresh to get latest DB state (object may be expired after prior commit)
+            await db.refresh(conversation)
+            now_utc = datetime.now(timezone.utc)
+            conversation.outbound_count = (conversation.outbound_count or 0) + 1
+            conversation.last_activity_at = now_utc
+            if conversation.lead_status in ("new", None):
+                conversation.lead_status = "contacted"
+                # Log lead_event for first contact
+                if i == 0:
+                    from app.db.models import LeadEvent
+                    db.add(LeadEvent(
+                        conversation_id=conversation.id,
+                        event_type="contacted",
+                        note=f"Initial outreach sent (part {i + 1})",
+                    ))
+            db.add(conversation)
+            await db.commit()
             if msg and msg.instance_id:
                 from sqlalchemy import select
                 res = await db.execute(
