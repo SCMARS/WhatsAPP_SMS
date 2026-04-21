@@ -119,6 +119,18 @@ def _clickability_trigger(language: str) -> str:
             "Mandame cualquier mensaje o emoji para activar el link. ¡Buena suerte! 🤞",
             "Respondé con cualquier cosa y el link queda activo al toque. ¡Mucha suerte! 🍀",
         ])
+    elif language == "ru":
+        return random.choice([
+            "Ссылка станет кликабельной, если ты напишешь мне любое сообщение (даже эмодзи) 🙂 Удачи! 🤞",
+            "Напиши мне что-нибудь или отправь эмодзи, и ссылка активируется. Удачи! 🤞",
+            "Ответь на сообщение любым текстом, и ссылка станет активной. Удачи! 🍀",
+        ])
+    elif language == "uz":
+        return random.choice([
+            "Havolaga bosgandek, shu chatga biron xabar jo'nating (hatto emoji ham bo'ladi) 🙂 Omad! 🤞",
+            "Menga biron xabar yoki emoji yuboring, havolasi faol bo'ladi. Omad! 🤞",
+            "Xabar bilan javob bering, havolasi faol bo'ladi. Omad! 🍀",
+        ])
     # Default: pt-PT
     return random.choice([
         "O link ficará clicável se enviares qualquer mensagem neste chat (mesmo um emoji) 🙂 Boa sorte 🤞",
@@ -150,6 +162,38 @@ def _missing_fields_tail(
                 f"Acá tenés el link: {link_url}",
                 f"Entrá por acá para jugar: {link_url}",
                 f"Link de activación: {link_url}",
+            ]))
+        return " ".join(parts).strip()
+
+    elif language == "ru":
+        parts = []
+        if "promo" in missing_fields and promo_code:
+            parts.append(random.choice([
+                f"Используй код: {promo_code}.",
+                f"Твой бонус активируется с кодом {promo_code}.",
+                f"Промокод: {promo_code}.",
+            ]))
+        if "link" in missing_fields and link_url:
+            parts.append(random.choice([
+                f"Вот твоя ссылка: {link_url}",
+                f"Заходи по этой ссылке: {link_url}",
+                f"Ссылка для активации: {link_url}",
+            ]))
+        return " ".join(parts).strip()
+
+    elif language == "uz":
+        parts = []
+        if "promo" in missing_fields and promo_code:
+            parts.append(random.choice([
+                f"Kodni ishlat: {promo_code}.",
+                f"Sizning bonus kod bilan faollashadi {promo_code}.",
+                f"Promokod: {promo_code}.",
+            ]))
+        if "link" in missing_fields and link_url:
+            parts.append(random.choice([
+                f"Vot sizning havolangiz: {link_url}",
+                f"Shu havolaga kiring: {link_url}",
+                f"Faollashtirish havolasi: {link_url}",
             ]))
         return " ".join(parts).strip()
 
@@ -262,6 +306,30 @@ _AR_TRIGGERS = [
     "Respondé con cualquier cosa y el link queda activo al toque. ¡Mucha suerte! 🍀",
 ]
 
+_RU_GREETINGS = [
+    "Привет! Как и обещала по телефону, высылаю тебе ссылку на твой персональный бонус:",
+]
+
+_RU_OFFERS = [
+    "🎁 100% к депозиту до 8.000.000 UZS\n🍭 + 50 фриспинов Sweet Bonanza\n⏰ Активация в течение 14 дней\n\n{link}",
+]
+
+_RU_TRIGGERS = [
+    "Если будут вопросы - пиши, всегда на связи!",
+]
+
+_UZ_GREETINGS = [
+    "Salom! Telefonda va'da qilganimdek, sizning shaxsiy bonusingiz havolasini yuborayapman:",
+]
+
+_UZ_OFFERS = [
+    "🎁 Depozitga 100% bonus 8.000.000 UZS gacha\n🍭 + Sweet Bonanza uchun 50 ta bepul aylanish\n⏰ Faollashtirish uchun 14 kun\n\n{link}",
+]
+
+_UZ_TRIGGERS = [
+    "Agar savollaringiz bo'lsa - yozing, doimo aloqadaman!",
+]
+
 
 def build_outreach_parts(
     language: str,
@@ -273,15 +341,29 @@ def build_outreach_parts(
       Part 1 — Personal greeting with persona name
       Part 2 — Offer details with promo/link
       Part 3 — Clickability trigger + good luck
-    Returns a list of 3 strings ready to send as separate WhatsApp messages.
+    Returns a list of 3 strings ready to send as separate WhatsApp/Telegram messages.
+    Supports languages: pt-PT, es-AR, ru, uz
     """
     promo = promo_code or "50Pragmatic"
+
+    # For RU and UZ, always use the fixed wrsend link
+    if language in ("ru", "uz"):
+        link_url = "https://wrsend.com/MvGQ03bo"
 
     if language == "es-AR":
         part1 = random.choice(_AR_GREETINGS)
         part2 = random.choice(_AR_OFFERS).format(link=link_url)
         part3 = random.choice(_AR_TRIGGERS)
+    elif language == "ru":
+        part1 = random.choice(_RU_GREETINGS)
+        part2 = random.choice(_RU_OFFERS).format(link=link_url)
+        part3 = random.choice(_RU_TRIGGERS)
+    elif language == "uz":
+        part1 = random.choice(_UZ_GREETINGS)
+        part2 = random.choice(_UZ_OFFERS).format(link=link_url)
+        part3 = random.choice(_UZ_TRIGGERS)
     else:
+        # Default: Portuguese
         part1 = random.choice(_PT_GREETINGS)
         part2 = random.choice(_PT_OFFERS).format(promo=promo, link=link_url)
         part3 = random.choice(_PT_TRIGGERS)
@@ -711,6 +793,10 @@ async def _generate_outreach_message_inner(
     link_url: str,
     promo_code: Optional[str] = None,
 ) -> list[str]:
+    # For RU and UZ, always use the fixed wrsend link
+    if language in ("ru", "uz"):
+        link_url = "https://wrsend.com/MvGQ03bo"
+
     session = _get_session(f"outreach:{chat_key}")
 
     # Warm-up turn: many agents send default "first message" greeting on a fresh WS session.
