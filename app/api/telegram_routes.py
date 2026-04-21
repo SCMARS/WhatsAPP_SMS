@@ -69,6 +69,7 @@ class TGSendRequest(BaseModel):
     lead_name: Optional[str] = None
     campaign_external_id: Optional[str] = None
     initial_message: Optional[str] = None
+    language: Optional[str] = None  # "ru" или "uz" - явно указать язык сообщения
     batch_index: int = 0
 
 
@@ -161,7 +162,7 @@ async def tg_send_endpoint(
     # Country / campaign resolution
     country_info = detect_country(req.phone)
     country_code = country_info["code"]
-    lang = country_info["lang"]
+    lang = req.language or country_info["lang"]  # Приоритет: явный параметр language, затем по стране
     promo = country_info["promo"]
     campaign_key = req.campaign_external_id or country_info["campaign"]
     lead_id = req.lead_id or req.phone
@@ -171,18 +172,23 @@ async def tg_send_endpoint(
         if await is_blacklisted(db, p):
             return {"status": "blacklisted"}
 
-    # Claim link
-    if country_code not in ("PT", "AR"):
+    # Claim link (or use hardcoded for RU/UZ)
+    if country_code not in ("PT", "AR", "UZ", "UA"):
         raise HTTPException(
             status_code=422,
             detail=f"Unsupported country: {country_code}",
         )
-    link_url = await claim_link(db, country_code, lead_id)
-    if link_url is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Link pool exhausted for country={country_code}",
-        )
+
+    # For RU/UZ, use hardcoded wrsend link (no pool needed)
+    if country_code in ("UZ",) and lang in ("ru", "uz"):
+        link_url = "https://wrsend.com/MvGQ03bo"
+    else:
+        link_url = await claim_link(db, country_code, lead_id)
+        if link_url is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Link pool exhausted for country={country_code}",
+            )
 
     # Campaign
     result = await db.execute(select(Campaign).where(Campaign.external_id == campaign_key))
@@ -275,17 +281,21 @@ async def tg_bulk_send_endpoint(
         # Country / link
         country_info = detect_country(lead.phone)
         country_code = country_info["code"]
-        lang = country_info["lang"]
+        lang = lead.language or country_info["lang"]  # Приоритет: явный параметр language, затем по стране
         promo = country_info["promo"]
 
-        if country_code not in ("PT", "AR"):
+        if country_code not in ("PT", "AR", "UZ"):
             results.append({"phone": lead.phone, "status": "error", "detail": f"unsupported country: {country_code}"})
             continue
 
-        link_url = await claim_link(db, country_code, lead.lead_id or lead.phone)
-        if link_url is None:
-            results.append({"phone": lead.phone, "status": "error", "detail": f"link pool exhausted for {country_code}"})
-            continue
+        # For RU/UZ, use hardcoded wrsend link (no pool needed)
+        if country_code in ("UZ",) and lang in ("ru", "uz"):
+            link_url = "https://wrsend.com/MvGQ03bo"
+        else:
+            link_url = await claim_link(db, country_code, lead.lead_id or lead.phone)
+            if link_url is None:
+                results.append({"phone": lead.phone, "status": "error", "detail": f"link pool exhausted for {country_code}"})
+                continue
 
         try:
             initial_text = await _resolve_initial_message(
@@ -449,6 +459,11 @@ async def tg_instances_endpoint(
             "block_rate": {"value": br, "classification": classify_tg_block_rate(br)},
             "last_send_at": inst.last_send_at.isoformat() if inst.last_send_at else None,
             "last_health_check": inst.last_health_check.isoformat() if inst.last_health_check else None,
+            "spambot_ok": inst.spambot_ok,
+            "spambot_checked_at": inst.spambot_checked_at.isoformat() if inst.spambot_checked_at else None,
+            "device_model": inst.device_model,
+            "proxy_configured": bool(inst.proxy_host),
+            "send_hours": {"start": inst.send_hour_start, "end": inst.send_hour_end},
             "created_at": inst.created_at.isoformat(),
         })
 

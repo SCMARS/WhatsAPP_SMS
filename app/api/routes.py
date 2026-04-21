@@ -32,6 +32,8 @@ def _to_elevenlabs_language(lang: Optional[str]) -> str:
         return "es-AR"
     if lang == "pt":
         return "pt-PT"
+    if lang in ("ru", "uz"):
+        return lang   # pass through — build_outreach_parts handles these directly
     return "pt-PT"
 
 
@@ -346,7 +348,7 @@ async def send_message_endpoint(
 
     logger.info(f"Incoming /api/send phone={req.phone} country={country_code} campaign={campaign_key} lang={lang}")
 
-    if country_code not in ("PT", "AR"):
+    if country_code not in ("PT", "AR", "UZ", "UA"):
         raise HTTPException(
             status_code=422,
             detail=f"Unsupported country for outbound link pool: {country_code}",
@@ -357,13 +359,17 @@ async def send_message_endpoint(
     if await is_blacklisted(db, _phone_digits) or await is_blacklisted(db, req.phone):
         return {"status": "blacklisted"}
 
-    # 3. Claim a link from the pool (block if exhausted)
-    link_url = await claim_link(db, country_code, lead_id)
-    if link_url is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Link pool exhausted for country={country_code}. Load more links via POST /api/links/load",
-        )
+    # 3. Claim a link from the pool (or use hardcoded for RU/UZ)
+    # For RU/UZ, use hardcoded wrsend link (no pool needed)
+    if country_code in ("UZ",) and lang in ("ru", "uz"):
+        link_url = "https://wrsend.com/MvGQ03bo"
+    else:
+        link_url = await claim_link(db, country_code, lead_id)
+        if link_url is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Link pool exhausted for country={country_code}. Load more links via POST /api/links/load",
+            )
 
     # 4. Find or auto-create campaign
     result = await db.execute(
@@ -510,6 +516,26 @@ async def bulk_send_endpoint(
             results.append({"phone": lead.phone, "status": "error", "detail": "campaign not found"})
             continue
 
+        # Determine country and link
+        country_info = detect_country(lead.phone)
+        country_code = country_info["code"]
+        lang = country_info["lang"]
+        promo = country_info["promo"]
+        lead_id = lead.lead_id or lead.phone
+
+        if country_code not in ("PT", "AR", "UZ"):
+            results.append({"phone": lead.phone, "status": "error", "detail": f"unsupported country: {country_code}"})
+            continue
+
+        # For RU/UZ, use hardcoded wrsend link (no pool needed)
+        if country_code in ("UZ",) and lang in ("ru", "uz"):
+            link_url = "https://wrsend.com/MvGQ03bo"
+        else:
+            link_url = await claim_link(db, country_code, lead_id)
+            if link_url is None:
+                results.append({"phone": lead.phone, "status": "error", "detail": f"link pool exhausted for {country_code}"})
+                continue
+
         # Find or create conversation
         result = await db.execute(
             select(Conversation).where(
@@ -538,22 +564,6 @@ async def bulk_send_endpoint(
             if not conversation.assigned_link_url and link_url:
                 conversation.assigned_link_url = link_url
                 await db.commit()
-
-        # Determine country and link
-        country_info = detect_country(lead.phone)
-        country_code = country_info["code"]
-        lang = country_info["lang"]
-        promo = country_info["promo"]
-        lead_id = lead.lead_id or lead.phone
-
-        if country_code not in ("PT", "AR"):
-            results.append({"phone": lead.phone, "status": "error", "detail": f"unsupported country: {country_code}"})
-            continue
-
-        link_url = await claim_link(db, country_code, lead_id)
-        if link_url is None:
-            results.append({"phone": lead.phone, "status": "error", "detail": f"link pool exhausted for {country_code}"})
-            continue
 
         # Determine initial message via ElevenLabs (returns list[str])
         try:
