@@ -3,10 +3,11 @@ Telegram message sender — mirrors app/services/sender.py for Telegram.
 
 Key flow:
   1. Get best TelegramInstance from pool
-  2. Resolve phone → Telegram user_id via import_contacts (cached in DB + memory)
+  2. Resolve phone → Telegram user_id via get_entity() (cached in DB + memory)
   3. Show typing indicator via client.action('typing')
   4. Send message
-  5. Handle FloodWaitError (sleep + retry once), UserPrivacyRestrictedError, PeerFloodError
+  5. Handle FloodWaitError (sleep + retry once), PeerFloodError, UserPrivacyRestrictedError,
+     UserIsBlockedError, InputUserDeactivatedError, ChatWriteForbiddenError, AuthKeyError
   6. Persist TelegramMessage to DB
 """
 
@@ -19,14 +20,28 @@ from typing import Optional
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from telethon.errors import (
+    # Auth / session errors → mark instance session_expired or banned
+    AuthKeyDuplicatedError,
+    AuthKeyError,
+    AuthKeyUnregisteredError,
+    # Account-level bans → mark instance as permanently banned
+    PhoneNumberBannedError,
+    UserDeactivatedBanError,
+    # Rate-limit errors → sleep + retry / cooldown
+    FloodPremiumWaitError,
     FloodWaitError,
     PeerFloodError,
-    UserPrivacyRestrictedError,
-    UserIsBlockedError,
+    # Recipient-side errors → blacklist lead (skip, not a ban for our account)
+    ChatWriteForbiddenError,
     InputUserDeactivatedError,
+    PeerIdInvalidError,
+    UserBlockedError,
+    UserDeactivatedError,
+    UserIdInvalidError,
+    UserIsBlockedError,
+    UserNotMutualContactError,
+    UserPrivacyRestrictedError,
 )
-from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
-from telethon.tl.types import InputPhoneContact
 
 from app.db.models import Conversation, TelegramInstance, TelegramMessage
 from app.services.blacklist import add_to_blacklist
@@ -100,38 +115,60 @@ async def _resolve_user_id(
         _user_id_cache[digits] = (uid_row, now)
         return uid_row
 
-    # 3. import_contacts — adds contact temporarily just to resolve the user_id
+    # 3. Direct entity resolution first
     try:
-        contact = InputPhoneContact(
-            client_id=random.randint(0, 2**31),
-            phone=f"+{digits}",
-            first_name="Lead",
-            last_name="",
-        )
-        result_contacts = await client(ImportContactsRequest([contact]))
-        users = result_contacts.users if hasattr(result_contacts, "users") else []
-
-        if not users:
-            logger.info(f"[TGSender] Phone +{digits} has no Telegram account")
-            await add_to_blacklist(db, phone, reason="tg_no_account")
-            return None
-
-        user_id = users[0].id
-        # Clean up — delete contact immediately (don't pollute the contacts list)
-        try:
-            await client(DeleteContactsRequest(id=[user_id]))
-        except Exception:
-            pass  # Cleanup failure is non-critical
-
+        entity = await client.get_entity(f"+{digits}")
+        user_id = entity.id
         _user_id_cache[digits] = (user_id, now)
         logger.debug(f"[TGSender] Resolved +{digits} → user_id={user_id}")
         return user_id
+    except (ValueError, UserIdInvalidError, PeerIdInvalidError):
+        # Not in contacts — try ImportContacts
+        pass
+    except FloodWaitError as e:
+        logger.warning(f"[TGSender] FloodWait {e.seconds}s during entity resolution for {phone}")
+        raise
+    except (UserDeactivatedError,):
+        # Definitively no valid Telegram account at this number
+        logger.info(f"[TGSender] Phone +{digits} has no Telegram account — blacklisting")
+        await add_to_blacklist(db, phone, reason="tg_no_account")
+        return None
+    except Exception as e:
+        # Transient error (network, DC migration, etc.) — do NOT blacklist
+        logger.warning(f"[TGSender] Transient error resolving +{digits}: {type(e).__name__}: {e}")
+        return None
+
+    # 4. ImportContacts as fallback (add as contact, resolve, delete)
+    try:
+        from telethon.tl.types import InputPhoneContact
+        from telethon.tl.functions.contacts import ImportContactsRequest
+
+        contact = InputPhoneContact(client_id=0, phone=f"+{digits}", first_name="TempContact", last_name="")
+        result = await client(ImportContactsRequest([contact]))
+
+        if result.imported and len(result.users) > 0:
+            user = result.users[0]
+            user_id = user.id
+            _user_id_cache[digits] = (user_id, now)
+            logger.info(f"[TGSender] ImportContacts resolved +{digits} → user_id={user_id}")
+
+            # Delete the temporary contact
+            try:
+                await client.delete_contacts(user_id)
+            except Exception as e:
+                logger.debug(f"[TGSender] Could not delete temp contact {digits}: {e}")
+
+            return user_id
+        else:
+            logger.info(f"[TGSender] Phone +{digits} has no Telegram account — blacklisting")
+            await add_to_blacklist(db, phone, reason="tg_no_account")
+            return None
 
     except FloodWaitError as e:
-        logger.warning(f"[TGSender] FloodWait {e.seconds}s during contact resolution for {phone}")
+        logger.warning(f"[TGSender] FloodWait {e.seconds}s during ImportContacts for {phone}")
         raise
     except Exception as e:
-        logger.error(f"[TGSender] Could not resolve phone {phone}: {e}")
+        logger.warning(f"[TGSender] ImportContacts failed for +{digits}: {type(e).__name__}: {e}")
         return None
 
 
@@ -144,8 +181,8 @@ async def _resolve_input_entity(
     Ensure the current Telethon client has a usable input entity for this user.
 
     A raw user_id cached in DB is not sufficient after client restart because the
-    entity cache is empty. In that case, re-import the phone contact to hydrate
-    the entity in the current session.
+    entity cache is empty. Falls back to resolving by phone string directly.
+    Never uses ImportContactsRequest.
     """
     try:
         return await client.get_input_entity(user_id)
@@ -154,29 +191,7 @@ async def _resolve_input_entity(
 
     digits = _phone_digits(phone)
     try:
-        contact = InputPhoneContact(
-            client_id=random.randint(0, 2**31),
-            phone=f"+{digits}",
-            first_name="Lead",
-            last_name="",
-        )
-        result_contacts = await client(ImportContactsRequest([contact]))
-        users = result_contacts.users if hasattr(result_contacts, "users") else []
-        if not users:
-            return None
-
-        user = users[0]
-        try:
-            entity = await client.get_input_entity(user.id)
-        except Exception:
-            entity = user
-
-        try:
-            await client(DeleteContactsRequest(id=[user.id]))
-        except Exception:
-            pass
-
-        return entity
+        return await client.get_input_entity(f"+{digits}")
     except Exception as e:
         logger.error(f"[TGSender] Could not hydrate input entity for {phone}: {e}")
         return None
@@ -245,12 +260,15 @@ async def send_tg_message(
             provider_message_id, error_text, status = await _do_tg_send(
                 client, peer, personalized
             )
-        except FloodWaitError as e:
+        except (FloodWaitError, FloodPremiumWaitError) as e:
             wait = e.seconds + random.uniform(5, 30)
-            logger.warning(f"[TGSender] FloodWait {e.seconds}s on {instance.phone_number}, sleeping {wait:.0f}s")
+            logger.warning(
+                f"[TGSender] {'FloodPremium' if isinstance(e, FloodPremiumWaitError) else 'Flood'}"
+                f"Wait {e.seconds}s on {instance.phone_number}, sleeping {wait:.0f}s"
+            )
             await _handle_flood_wait(db, instance, e.seconds)
             await asyncio.sleep(wait)
-            # One retry
+            # One retry after the wait
             try:
                 provider_message_id, error_text, status = await _do_tg_send(
                     client, peer, personalized
@@ -258,21 +276,56 @@ async def send_tg_message(
             except Exception as e2:
                 error_text = str(e2)
                 logger.error(f"[TGSender] Retry failed for {conversation.phone}: {e2}")
-        except UserPrivacyRestrictedError:
-            logger.info(f"[TGSender] {conversation.phone} has privacy settings blocking messages — blacklisting")
+
+        # ---- Recipient-side errors — skip this lead, NOT an account-level ban ----
+        except (
+            UserPrivacyRestrictedError,
+            UserNotMutualContactError,
+        ):
+            logger.info(
+                f"[TGSender] {conversation.phone} has privacy/mutual-contact restriction — blacklisting"
+            )
             await add_to_blacklist(db, conversation.phone, reason="tg_privacy_restricted")
             return None
-        except (UserIsBlockedError, InputUserDeactivatedError):
-            logger.info(f"[TGSender] {conversation.phone} blocked us or deactivated — blacklisting")
+        except (
+            UserIsBlockedError,
+            UserBlockedError,
+            InputUserDeactivatedError,
+            UserDeactivatedError,
+            PeerIdInvalidError,
+            UserIdInvalidError,
+        ):
+            logger.info(f"[TGSender] {conversation.phone} is blocked/deactivated/invalid — blacklisting")
             await add_to_blacklist(db, conversation.phone, reason="tg_blocked")
             return None
+        except ChatWriteForbiddenError:
+            logger.info(f"[TGSender] ChatWriteForbidden for {conversation.phone} — blacklisting")
+            await add_to_blacklist(db, conversation.phone, reason="tg_write_forbidden")
+            return None
+
+        # ---- Account-level rate flood — cooldown, not a ban ----
         except PeerFloodError:
-            logger.warning(f"[TGSender] PeerFloodError on {instance.phone_number} — entering 30-min cooldown")
+            logger.warning(f"[TGSender] PeerFloodError on {instance.phone_number} — 30-min cooldown")
             await _handle_peer_flood(db, instance)
             return None
+
+        # ---- Sender account permanently banned ----
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            logger.error(
+                f"[TGSender] Account {instance.phone_number} is BANNED ({type(e).__name__}) — deactivating"
+            )
+            await tg_pool.mark_tg_banned(db, instance.phone_number)
+            return None
+
+        # ---- Auth / session errors ----
+        except (AuthKeyUnregisteredError, AuthKeyDuplicatedError, AuthKeyError):
+            logger.warning(f"[TGSender] Auth key invalid/expired for {instance.phone_number} — session expired")
+            await _handle_session_expired(db, instance)
+            return None
+
         except Exception as e:
             error_text = str(e)
-            logger.error(f"[TGSender] Send failed for {conversation.phone}: {e}")
+            logger.error(f"[TGSender] Send failed for {conversation.phone}: {type(e).__name__}: {e}")
 
     if status == "sent":
         await tg_pool.record_tg_send(instance.phone_number)
@@ -311,6 +364,22 @@ async def _do_tg_send(
     message = await client.send_message(peer, text)
     provider_id = str(message.id) if message else None
     return provider_id, None, "sent"
+
+
+async def _handle_session_expired(
+    db: AsyncSession,
+    instance: TelegramInstance,
+) -> None:
+    """Session was revoked server-side; mark it expired and disconnect the client."""
+    await db.execute(
+        update(TelegramInstance)
+        .where(TelegramInstance.phone_number == instance.phone_number)
+        .values(is_authorized=False, is_active=False, health_status="session_expired")
+    )
+    await db.commit()
+    from app.services.telegram.client_manager import disconnect_client
+    await disconnect_client(instance.phone_number)
+    logger.warning(f"[TGSender] {instance.phone_number} session expired — disconnected")
 
 
 async def _handle_flood_wait(
@@ -418,6 +487,6 @@ async def send_initial_tg_message(
             await db.commit()
 
         if i < len(messages) - 1:
-            await reply_pause(min_sec=3.0, max_sec=6.0)
+            await reply_pause(min_sec=5.0, max_sec=12.0)
 
     return last_msg
