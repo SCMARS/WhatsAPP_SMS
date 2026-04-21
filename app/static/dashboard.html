@@ -147,6 +147,26 @@
   <!-- Funnel -->
   <div class="funnel" id="funnelBar"></div>
 
+  <!-- Quick Send Telegram Section -->
+  <div style="background: var(--surface2); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 16px 24px; margin-bottom: 16px;">
+    <div style="display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap;">
+      <div style="flex: 1; min-width: 200px;">
+        <label style="display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; font-weight: 600;">Phone Number</label>
+        <input type="text" id="quickSendPhone" placeholder="+1234567890 или 1234567890" style="width: 100%; background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 12px; font-size: 13px; font-family: 'SF Mono', monospace;">
+      </div>
+      <div style="min-width: 140px;">
+        <label style="display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; font-weight: 600;">Language</label>
+        <select id="quickSendLang" style="width: 100%; background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 8px 12px; font-size: 13px;">
+          <option value="">Select…</option>
+          <option value="ru">🇷🇺 Русский</option>
+          <option value="uz">🇺🇿 Ўзбек</option>
+        </select>
+      </div>
+      <button class="btn" id="quickSendBtn" onclick="quickSendTelegram()">📤 Send Telegram</button>
+    </div>
+    <div id="quickSendStatus" style="margin-top: 8px; font-size: 12px; color: var(--muted); display: none;"></div>
+  </div>
+
   <!-- Filters -->
   <div class="filters">
     <input type="text" id="searchInput" placeholder="Search phone or name…" style="width:220px" oninput="debounceLoad()"/>
@@ -488,6 +508,53 @@ async function addNote(phone) {
     document.getElementById('noteInput').value = '';
     openPanel(_panelPhone, _panelPlatform);
   } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function quickSendTelegram() {
+  const phone = document.getElementById('quickSendPhone').value.trim();
+  const lang = document.getElementById('quickSendLang').value;
+  const btn = document.getElementById('quickSendBtn');
+  const statusDiv = document.getElementById('quickSendStatus');
+
+  if (!phone || !lang) {
+    statusDiv.textContent = '❌ Enter phone and select language';
+    statusDiv.style.display = 'block';
+    statusDiv.style.color = 'var(--red)';
+    return;
+  }
+
+  btn.disabled = true;
+  statusDiv.textContent = '⏳ Sending…';
+  statusDiv.style.display = 'block';
+  statusDiv.style.color = 'var(--muted)';
+
+  try {
+    const res = await api('/api/telegram/send', {
+      method: 'POST',
+      body: JSON.stringify({
+        phone: phone,
+        language: lang,
+      }),
+    });
+
+    statusDiv.textContent = '✅ Message queued! ID: ' + (res.conversation_id || 'sent');
+    statusDiv.style.color = 'var(--green)';
+    document.getElementById('quickSendPhone').value = '';
+    document.getElementById('quickSendLang').value = '';
+
+    // Clear status after 5 seconds
+    setTimeout(() => {
+      statusDiv.style.display = 'none';
+    }, 5000);
+
+    // Refresh leads
+    setTimeout(() => loadLeads(false), 1000);
+  } catch(e) {
+    statusDiv.textContent = '❌ Error: ' + (e.message || 'Send failed');
+    statusDiv.style.color = 'var(--red)';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function exportCsv() {
