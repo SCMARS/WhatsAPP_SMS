@@ -223,6 +223,20 @@ async def send_tg_message(
         logger.error(f"[TGSender] No live client for {instance.phone_number}")
         return None
 
+    # Pre-add contact before resolution (helps with privacy-restricted accounts)
+    try:
+        from telethon.tl.types import InputPhoneContact
+        from telethon.tl.functions.contacts import ImportContactsRequest
+
+        digits = _phone_digits(conversation.phone)
+        contact = InputPhoneContact(client_id=0, phone=f"+{digits}", first_name="User", last_name="")
+        await client(ImportContactsRequest([contact]))
+        logger.debug(f"[TGSender] Pre-added {conversation.phone} as contact")
+        await asyncio.sleep(0.5)  # Brief sync delay
+    except Exception as e:
+        logger.debug(f"[TGSender] Could not pre-add contact {conversation.phone}: {e}")
+        # Continue anyway — contact pre-add is best-effort
+
     # Personalize
     personalized = insert_zero_width(text)
     if not is_reply:
