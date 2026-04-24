@@ -14,7 +14,7 @@ States mapped:
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select, update
@@ -22,6 +22,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import TelegramInstance
 from app.db.session import AsyncSessionLocal
+
+# @SpamBot check: run at most once per 24 h per account
+_SPAMBOT_CHECK_INTERVAL_HOURS = 24
+# Phrases in @SpamBot response that indicate the account is clean
+_SPAMBOT_CLEAN_PHRASES = (
+    "no limits are currently",
+    "no longer limited",
+    "not limited",
+)
+# Phrases that indicate the account is restricted
+_SPAMBOT_RESTRICTED_PHRASES = (
+    "limited because",
+    "been limited",
+    "restricted",
+    "can't send",
+)
 from app.services.telegram.reply_monitor import (
     TG_BLOCK_RATE_DANGER,
     TG_BLOCK_RATE_WARNING,
@@ -119,6 +135,9 @@ async def check_tg_instance(inst: TelegramInstance) -> None:
     # Healthy — reset flood count, update status
     await _update_status(phone, "authorized", is_active=True, reset_flood=True)
 
+    # @SpamBot proactive check (once per 24 h)
+    await _maybe_check_spambot(client, inst)
+
     # Check reply and block rates
     async with AsyncSessionLocal() as db:
         rr = await get_tg_reply_rate(db, phone)
@@ -137,6 +156,60 @@ async def check_tg_instance(inst: TelegramInstance) -> None:
                          phone, br * 100, TG_BLOCK_RATE_DANGER * 100)
         elif br > TG_BLOCK_RATE_WARNING:
             logger.warning("[TGHealthMonitor] %s block rate=%.1f%% — WARNING", phone, br * 100)
+
+
+async def _maybe_check_spambot(client, inst: TelegramInstance) -> None:
+    """
+    Send /start to @SpamBot and parse its reply to detect soft-bans.
+
+    Only runs once per _SPAMBOT_CHECK_INTERVAL_HOURS per account.
+    A soft-ban (account limited but not session_expired) is logged as a warning
+    and reflected in the spambot_ok field — the account stays active so operators
+    can decide whether to pause it.
+    """
+    now = datetime.now(timezone.utc)
+    if inst.spambot_checked_at is not None:
+        checked_at = inst.spambot_checked_at
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=timezone.utc)
+        if (now - checked_at).total_seconds() < _SPAMBOT_CHECK_INTERVAL_HOURS * 3600:
+            return  # checked recently, skip
+
+    try:
+        await client.send_message("spambot", "/start")
+        await asyncio.sleep(3)  # wait for @SpamBot to reply
+
+        messages = await client.get_messages("spambot", limit=1)
+        if not messages:
+            return
+
+        response_text = (messages[0].message or "").lower()
+
+        if any(phrase in response_text for phrase in _SPAMBOT_CLEAN_PHRASES):
+            spambot_ok = True
+            logger.info("[TGHealthMonitor] %s @SpamBot: account clean ✓", inst.phone_number)
+        elif any(phrase in response_text for phrase in _SPAMBOT_RESTRICTED_PHRASES):
+            spambot_ok = False
+            logger.warning(
+                "[TGHealthMonitor] %s @SpamBot: account RESTRICTED — reduce send volume. "
+                "Response: %s",
+                inst.phone_number, response_text[:200],
+            )
+        else:
+            spambot_ok = None  # unknown response
+            logger.debug("[TGHealthMonitor] %s @SpamBot: unrecognised response: %s",
+                         inst.phone_number, response_text[:200])
+
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(TelegramInstance)
+                .where(TelegramInstance.phone_number == inst.phone_number)
+                .values(spambot_ok=spambot_ok, spambot_checked_at=now)
+            )
+            await db.commit()
+
+    except Exception as e:
+        logger.warning("[TGHealthMonitor] %s @SpamBot check failed: %s", inst.phone_number, e)
 
 
 async def _update_status(

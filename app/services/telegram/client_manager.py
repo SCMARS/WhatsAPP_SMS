@@ -13,6 +13,7 @@ Shutdown (called from main.py lifespan):
 
 import asyncio
 import logging
+import random
 from typing import Optional
 
 from sqlalchemy import select, update
@@ -21,6 +22,66 @@ from telethon.sessions import StringSession
 
 from app.db.models import TelegramInstance
 from app.db.session import AsyncSessionLocal
+
+# ---------------------------------------------------------------------------
+# Per-account device fingerprint pool
+# Each account is assigned one profile deterministically (by phone hash) so
+# the fingerprint is stable across reconnects without storing it in DB first.
+# Once assigned, it is persisted back to DB so it never changes.
+# ---------------------------------------------------------------------------
+_DEVICE_PROFILES = [
+    {"device_model": "Samsung SM-S908E",   "system_version": "12",   "app_version": "10.3.1"},
+    {"device_model": "Samsung SM-G998B",   "system_version": "11",   "app_version": "10.2.9"},
+    {"device_model": "Samsung SM-A536B",   "system_version": "12",   "app_version": "10.3.5"},
+    {"device_model": "Xiaomi 2201123G",    "system_version": "12",   "app_version": "10.3.1"},
+    {"device_model": "Xiaomi 22071212AG",  "system_version": "12",   "app_version": "10.2.5"},
+    {"device_model": "Redmi Note 11",      "system_version": "11",   "app_version": "10.1.5"},
+    {"device_model": "OnePlus IN2013",     "system_version": "11",   "app_version": "10.1.1"},
+    {"device_model": "OnePlus Nord 2T",    "system_version": "12",   "app_version": "10.3.1"},
+    {"device_model": "Pixel 6a",           "system_version": "13",   "app_version": "10.3.5"},
+    {"device_model": "Pixel 7",            "system_version": "13",   "app_version": "10.3.1"},
+    {"device_model": "POCO X5 Pro",        "system_version": "12",   "app_version": "10.2.9"},
+    {"device_model": "realme 9 Pro",       "system_version": "12",   "app_version": "10.3.1"},
+    {"device_model": "OPPO Reno8",         "system_version": "12",   "app_version": "10.2.5"},
+    {"device_model": "vivo V25",           "system_version": "12",   "app_version": "10.3.1"},
+    {"device_model": "Motorola Edge 30",   "system_version": "12",   "app_version": "10.2.9"},
+    {"device_model": "Nokia G60",          "system_version": "12",   "app_version": "10.1.5"},
+    {"device_model": "Sony Xperia 10 IV", "system_version": "12",    "app_version": "10.3.1"},
+    {"device_model": "Huawei Nova 9",      "system_version": "11",   "app_version": "10.2.5"},
+    {"device_model": "ZTE Blade V40",      "system_version": "11",   "app_version": "10.1.1"},
+    {"device_model": "Tecno Camon 19",     "system_version": "12",   "app_version": "10.2.9"},
+]
+
+
+def _pick_device_profile(phone_number: str) -> dict:
+    """Deterministically pick a device profile based on the phone number."""
+    idx = abs(hash(phone_number)) % len(_DEVICE_PROFILES)
+    return _DEVICE_PROFILES[idx].copy()
+
+
+def _build_proxy(inst: TelegramInstance) -> Optional[dict]:
+    """Build proxy dict for TelegramClient if the instance has a proxy configured."""
+    if not inst.proxy_host or not inst.proxy_port:
+        return None
+    try:
+        import socks
+        proxy: dict = {
+            "proxy_type": socks.SOCKS5,
+            "addr": inst.proxy_host,
+            "port": inst.proxy_port,
+            "rdns": True,
+        }
+        if inst.proxy_username:
+            proxy["username"] = inst.proxy_username
+            proxy["password"] = inst.proxy_password or ""
+        return proxy
+    except ImportError:
+        logger.warning(
+            "[TGClientManager] PySocks not installed — proxy ignored for %s. "
+            "Run: pip install PySocks",
+            inst.phone_number,
+        )
+        return None
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +238,54 @@ async def _connect_instance(inst: TelegramInstance) -> bool:
         return False
 
     try:
+        # Resolve device fingerprint — use stored values or auto-generate + persist
+        if inst.device_model and inst.system_version and inst.app_version:
+            device = {
+                "device_model":   inst.device_model,
+                "system_version": inst.system_version,
+                "app_version":    inst.app_version,
+                "lang_code":      inst.lang_code or "en",
+                "system_lang_code": inst.lang_code or "en",
+            }
+        else:
+            device = _pick_device_profile(inst.phone_number)
+            device["lang_code"] = inst.lang_code or "en"
+            device["system_lang_code"] = inst.lang_code or "en"
+            # Persist so it never changes for this account
+            async with AsyncSessionLocal() as db:
+                await db.execute(
+                    update(TelegramInstance)
+                    .where(TelegramInstance.phone_number == inst.phone_number)
+                    .values(
+                        device_model=device["device_model"],
+                        system_version=device["system_version"],
+                        app_version=device["app_version"],
+                        lang_code=device["lang_code"],
+                    )
+                )
+                await db.commit()
+            logger.info(
+                "[TGClientManager] %s: assigned device fingerprint %s / Android %s",
+                inst.phone_number, device["device_model"], device["system_version"],
+            )
+
+        proxy = _build_proxy(inst)
+
         session = StringSession(inst.session_string)
         client = TelegramClient(
             session,
             inst.api_id,
             inst.api_hash,
-            flood_sleep_threshold=20,  # auto-sleep for waits ≤ 20s
+            device_model=device["device_model"],
+            system_version=device["system_version"],
+            app_version=device["app_version"],
+            lang_code=device["lang_code"],
+            system_lang_code=device["system_lang_code"],
+            flood_sleep_threshold=20,  # auto-sleep for Telegram-requested waits ≤ 20s
+            connection_retries=3,       # reconnect attempts before giving up
+            retry_delay=5,              # seconds between reconnect attempts
+            auto_reconnect=True,
+            **({"proxy": proxy} if proxy else {}),
         )
         await client.connect()
 

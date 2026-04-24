@@ -551,3 +551,44 @@ async def tg_reply_rates_endpoint(
         reverse=True,
     )
     return {"instances": items}
+
+
+@router.get("/api/telegram/sender/status")
+async def tg_sender_status_endpoint() -> dict[str, Any]:
+    """Return advanced_sender.py progress from status.json (no auth required for dashboard polling)."""
+    import json
+    import os
+    from datetime import date
+
+    status_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "status.json")
+    if not os.path.exists(status_path):
+        return {"contacts_total": 0, "sent_total": 0, "replied_total": 0, "filtered_total": 0, "daily_counts": {}, "hot_leads": [], "running": False}
+
+    try:
+        with open(status_path) as f:
+            data = json.load(f)
+    except Exception:
+        return {"error": "status.json unreadable"}
+
+    contacts = data.get("contacts", {})
+    today = date.today().isoformat()
+
+    sent_total = sum(len(c.get("sent_stages", {})) for c in contacts.values())
+    replied = [{"phone": p, "first_name": c.get("first_name", "")} for p, c in contacts.items() if c.get("replied")]
+    filtered = sum(1 for c in contacts.values() if c.get("stopped") and c.get("stop_reason") in ("bot", "no_photo"))
+    not_found = sum(1 for c in contacts.values() if c.get("stop_reason") == "not_found")
+
+    daily_counts = data.get("daily_counts", {})
+    today_total = sum(v.get(today, 0) for v in daily_counts.values())
+
+    return {
+        "contacts_total": len(contacts),
+        "sent_total": sent_total,
+        "replied_total": len(replied),
+        "filtered_total": filtered,
+        "not_found_total": not_found,
+        "today_total": today_total,
+        "hot_leads": replied,
+        "daily_counts": {acc: counts.get(today, 0) for acc, counts in daily_counts.items()},
+        "running": False,
+    }

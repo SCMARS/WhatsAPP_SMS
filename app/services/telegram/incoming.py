@@ -289,6 +289,12 @@ async def _handle_locked(event, inst: TelegramInstance, sender, telegram_user_id
         if not reply:
             reply = "По деталям бонуса и условиям заходи к нам в чат поддержки на сайте! ✨"
 
+        # 10a. Mark messages as read — natural human behaviour before replying
+        try:
+            await client.send_read_acknowledge(event.chat_id)
+        except Exception:
+            pass  # non-critical
+
         # 11. Send reply via the same instance that originally sent to this user
         from app.services.telegram.sender import send_tg_message
 

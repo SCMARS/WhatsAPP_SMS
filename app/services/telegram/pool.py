@@ -148,6 +148,22 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _within_send_hours(inst: TelegramInstance) -> bool:
+    """
+    Return True if the current UTC hour is within the instance's allowed sending window.
+
+    Defaults to 08:00–22:00 UTC if no window is configured.
+    Outside this window sending is blocked on passes 0 and 1 (still allowed on pass 2
+    as a last resort if the campaign operator knowingly sends at off-hours).
+    """
+    hour = _now_utc().hour
+    start = getattr(inst, "send_hour_start", None)
+    end   = getattr(inst, "send_hour_end",   None)
+    start = start if start is not None else 8
+    end   = end   if end   is not None else 22
+    return start <= hour < end
+
+
 def _prune(phone: str) -> None:
     cutoff = _now_utc() - timedelta(hours=24)
     _send_log[phone] = [ts for ts in _send_log[phone] if ts > cutoff]
@@ -242,12 +258,15 @@ async def get_best_tg_instance(
                 # Flood-prone instances are deprioritised on passes 0 and 1
                 flood_prone     = inst.flood_wait_count >= 3
 
+                outside_hours = not _within_send_hours(inst)
+
                 if pass_num == 0:
-                    if in_reply_danger or in_block_danger or needs_rest or flood_prone:
+                    if in_reply_danger or in_block_danger or needs_rest or flood_prone or outside_hours:
                         continue
                 elif pass_num == 1:
-                    if needs_rest:
+                    if needs_rest or outside_hours:
                         continue
+                # pass 2: all constraints lifted — last resort
 
                 if best is None or hourly < best_hourly:
                     best = inst

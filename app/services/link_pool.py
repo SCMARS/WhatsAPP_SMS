@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import LinkPool
 
 logger = logging.getLogger(__name__)
-ALLOWED_POOL_COUNTRIES = {"PT", "AR"}
+ALLOWED_POOL_COUNTRIES = {"PT", "AR", "UZ", "UA"}
 
 
 async def claim_link(db: AsyncSession, country: str, lead_id: str) -> Optional[str]:

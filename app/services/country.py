@@ -20,6 +20,22 @@ COUNTRY_MAP = {
         "lang": "es",
         "promo": None,
     },
+    # Uzbekistan
+    "998": {
+        "code": "UZ",
+        "name": "Uzbekistan",
+        "campaign": "uzbekistan",
+        "lang": "uz",
+        "promo": None,
+    },
+    # Ukraine
+    "380": {
+        "code": "UA",
+        "name": "Ukraine",
+        "campaign": "ukraine",
+        "lang": "ru",
+        "promo": None,
+    },
 }
 
 # Default fallback if country not recognized

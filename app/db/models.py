@@ -198,6 +198,28 @@ class TelegramInstance(Base):
     # Consecutive FloodWait events this cycle — instances with ≥3 are deprioritised.
     flood_wait_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # ── Device fingerprint — unique per account, stored after first connect ────
+    # Passed to TelegramClient constructor so each account looks like a different device.
+    device_model: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    system_version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    app_version: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    lang_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True, server_default="en")
+
+    # ── Per-account SOCKS5 proxy — one IP per account ─────────────────────────
+    proxy_host: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    proxy_port: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    proxy_username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    proxy_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # ── Sending hours window (UTC, inclusive start / exclusive end) ────────────
+    # Only send messages within this hour range to simulate human activity.
+    send_hour_start: Mapped[int] = mapped_column(Integer, default=8, nullable=False, server_default="8")
+    send_hour_end: Mapped[int] = mapped_column(Integer, default=22, nullable=False, server_default="22")
+
+    # ── @SpamBot health signal ─────────────────────────────────────────────────
+    spambot_ok: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    spambot_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

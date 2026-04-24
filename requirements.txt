@@ -16,3 +16,4 @@ certifi
 phonenumbers
 python-telegram-bot>=20.0
 telethon>=1.36.0
+PySocks>=1.7.1

@@ -13,6 +13,7 @@ from app.config import settings
 from app.db.session import init_db
 from app.api.routes import router
 from app.api.telegram_routes import router as tg_router
+from app.api.telegram_auth_routes import router as auth_router
 from app.api.leads_routes import router as leads_router
 from app.services.ignore_followup import run_ignore_followup_worker
 from app.services.health_monitor import run_health_monitor
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 # per-route `require_api_key` dependency.
 # ---------------------------------------------------------------------------
 
-_PUBLIC_PREFIXES = ("/health", "/webhook/", "/docs", "/openapi.json", "/redoc", "/dashboard")
+_PUBLIC_PREFIXES = ("/health", "/webhook/", "/docs", "/openapi.json", "/redoc", "/dashboard", "/telegram-auth")
 
 
 class ApiKeyMiddleware(BaseHTTPMiddleware):
@@ -106,12 +107,19 @@ app.add_middleware(
 
 app.include_router(router)
 app.include_router(tg_router)
+app.include_router(auth_router)
 app.include_router(leads_router)
 
 
 @app.get("/dashboard", include_in_schema=False)
 async def serve_dashboard():
     path = os.path.join(os.path.dirname(__file__), "app", "static", "dashboard.html")
+    return FileResponse(path, media_type="text/html")
+
+
+@app.get("/telegram-auth", include_in_schema=False)
+async def serve_telegram_auth():
+    path = os.path.join(os.path.dirname(__file__), "app", "static", "telegram_auth.html")
     return FileResponse(path, media_type="text/html")
 
 

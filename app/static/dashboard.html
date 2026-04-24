@@ -114,6 +114,45 @@
   .funnel-bar .f-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin-bottom: 4px; }
   .funnel-bar .f-count { font-size: 22px; font-weight: 700; }
 
+  /* ── TG Accounts panel ── */
+  .tg-accounts { padding: 0 24px 16px; }
+  .tg-accounts-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; cursor: pointer; user-select: none; }
+  .tg-accounts-header h3 { font-size: 13px; font-weight: 700; letter-spacing: -0.2px; }
+  .tg-accounts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .tg-acc-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .tg-acc-card.banned { border-color: var(--red); }
+  .tg-acc-card.flood { border-color: var(--yellow); }
+  .tg-acc-name { font-weight: 600; font-size: 13px; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tg-acc-phone { font-size: 11px; color: var(--muted); font-family: 'SF Mono', monospace; margin-bottom: 8px; }
+  .tg-acc-rows { display: flex; flex-direction: column; gap: 3px; }
+  .tg-acc-row { display: flex; justify-content: space-between; font-size: 11px; }
+  .tg-acc-row .k { color: var(--muted); }
+  .tg-acc-row .v { font-weight: 600; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; }
+  .dot-green { background: var(--green); }
+  .dot-red { background: var(--red); }
+  .dot-yellow { background: var(--yellow); }
+  .dot-gray { background: var(--muted); }
+
+  /* Sender stats panel */
+  .sender-panel { padding: 0 24px 16px; }
+  .sender-panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; cursor: pointer; user-select: none; }
+  .sender-panel-header h3 { font-size: 13px; font-weight: 700; letter-spacing: -0.2px; }
+  .sender-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+  .sender-stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; text-align: center; }
+  .sender-stat .sv { font-size: 22px; font-weight: 700; line-height: 1.1; }
+  .sender-stat .sk { font-size: 11px; color: var(--muted); margin-top: 3px; }
+  .sender-hot { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+  .sender-hot h4 { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+  .sender-hot-item { font-size: 11px; padding: 3px 0; border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+  .sender-hot-item:last-child { border-bottom: none; }
+  .sender-acc-bar { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+  .sender-acc-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+  .sender-acc-row .acc-name { width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+  .sender-acc-row .bar-wrap { flex: 1; height: 6px; background: var(--border); border-radius: 3px; }
+  .sender-acc-row .bar-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width .3s; }
+  .sender-acc-row .bar-count { min-width: 30px; text-align: right; font-weight: 600; }
+
   .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .loading { display: flex; align-items: center; gap: 8px; padding: 40px; justify-content: center; color: var(--muted); }
@@ -129,7 +168,7 @@
     <h1>Leads <span>Dashboard</span></h1>
     <div style="display:flex;gap:10px;align-items:center">
       <button class="btn sm outline" onclick="exportCsv()">Export CSV</button>
-      <button class="btn sm outline" onclick="loadLeads(true);loadStats();loadFunnel()">↺ Refresh</button>
+      <button class="btn sm outline" onclick="loadLeads(true);loadStats();loadFunnel();loadTgAccounts();loadSenderStats()">↺ Refresh</button>
     </div>
   </div>
 
@@ -166,6 +205,24 @@
       <button class="btn" id="quickSendWABtn" onclick="quickSendWhatsApp()">📱 Send WhatsApp</button>
     </div>
     <div id="quickSendStatus" style="margin-top: 8px; font-size: 12px; color: var(--muted); display: none;"></div>
+  </div>
+
+  <!-- Telegram Accounts -->
+  <div class="tg-accounts" id="tgAccountsSection">
+    <div class="tg-accounts-header" onclick="toggleTgAccounts()">
+      <h3>📱 Telegram Accounts <span id="tgAccCount" style="color:var(--muted);font-weight:400;font-size:12px"></span></h3>
+      <button class="btn sm outline" onclick="event.stopPropagation();loadTgAccounts()">↺</button>
+    </div>
+    <div id="tgAccountsGrid" class="tg-accounts-grid"></div>
+  </div>
+
+  <!-- Sender Stats -->
+  <div class="sender-panel" id="senderPanel">
+    <div class="sender-panel-header" onclick="toggleSenderPanel()">
+      <h3>📤 Sender Progress <span id="senderStatus" style="color:var(--muted);font-weight:400;font-size:12px"></span></h3>
+      <button class="btn sm outline" onclick="event.stopPropagation();loadSenderStats()">↺</button>
+    </div>
+    <div id="senderContent"></div>
   </div>
 
   <!-- Filters -->
@@ -257,6 +314,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   loadStats();
   loadLeads(true);
   loadFunnel();
+  loadTgAccounts();
+  loadSenderStats();
 });
 
 function debounceLoad() {
@@ -623,6 +682,114 @@ async function exportCsv() {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
+}
+
+// ── Telegram Accounts ──────────────────────────────────────────────────────
+let tgAccountsVisible = true;
+
+function toggleTgAccounts() {
+  tgAccountsVisible = !tgAccountsVisible;
+  document.getElementById('tgAccountsGrid').style.display = tgAccountsVisible ? '' : 'none';
+}
+
+async function loadTgAccounts() {
+  const grid = document.getElementById('tgAccountsGrid');
+  grid.innerHTML = '<div class="loading"><div class="spinner"></div> Loading accounts…</div>';
+  try {
+    const data = await api('/api/telegram/instances');
+    const instances = data.instances || [];
+    document.getElementById('tgAccCount').textContent = `(${instances.length})`;
+
+    if (!instances.length) {
+      grid.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px">No accounts registered. Run import_accounts_to_db.py</div>';
+      return;
+    }
+
+    grid.innerHTML = instances.map(inst => {
+      const health = inst.health_status || 'unknown';
+      const spamOk = inst.spambot_ok;
+      const isBanned = inst.is_banned;
+      const isFlood = health === 'flood_wait';
+      const cardCls = isBanned ? 'tg-acc-card banned' : isFlood ? 'tg-acc-card flood' : 'tg-acc-card';
+      const dotCls = isBanned ? 'dot dot-red' : inst.is_active ? 'dot dot-green' : 'dot dot-yellow';
+      const spamStr = spamOk === null || spamOk === undefined ? '❓' : spamOk ? '✅ Чист' : '⛔ Блок';
+      const dailyUsed = inst.stats?.daily || 0;
+      const dailyLimit = inst.daily_limit || '—';
+      const rr = inst.reply_rate?.value != null ? (inst.reply_rate.value * 100).toFixed(1) + '%' : '—';
+      const br = inst.block_rate?.value != null ? (inst.block_rate.value * 100).toFixed(1) + '%' : '—';
+      const lastSend = inst.last_send_at ? fmtDate(inst.last_send_at) : 'never';
+      const connected = inst.connected ? '🟢 Online' : '🔴 Offline';
+      return `
+        <div class="${cardCls}">
+          <div class="tg-acc-name"><span class="${dotCls}"></span>${esc(inst.name)}</div>
+          <div class="tg-acc-phone">+${esc(inst.phone_number)}</div>
+          <div class="tg-acc-rows">
+            <div class="tg-acc-row"><span class="k">Status</span><span class="v">${connected}</span></div>
+            <div class="tg-acc-row"><span class="k">Health</span><span class="v">${esc(health)}</span></div>
+            <div class="tg-acc-row"><span class="k">SpamBot</span><span class="v">${spamStr}</span></div>
+            <div class="tg-acc-row"><span class="k">Sent today</span><span class="v">${dailyUsed} / ${dailyLimit}</span></div>
+            <div class="tg-acc-row"><span class="k">Reply rate</span><span class="v">${rr}</span></div>
+            <div class="tg-acc-row"><span class="k">Block rate</span><span class="v">${br}</span></div>
+            <div class="tg-acc-row"><span class="k">Device</span><span class="v" style="font-size:10px">${esc(inst.device_model || '—')}</span></div>
+            <div class="tg-acc-row"><span class="k">Last send</span><span class="v" style="font-size:10px">${lastSend}</span></div>
+          </div>
+        </div>`;
+    }).join('');
+  } catch(e) {
+    grid.innerHTML = `<div style="color:var(--red);font-size:12px;padding:8px">❌ ${e.message}</div>`;
+  }
+}
+
+// ── Sender Stats ───────────────────────────────────────────────────────────
+let senderPanelVisible = true;
+
+function toggleSenderPanel() {
+  senderPanelVisible = !senderPanelVisible;
+  document.getElementById('senderContent').style.display = senderPanelVisible ? '' : 'none';
+}
+
+async function loadSenderStats() {
+  const el = document.getElementById('senderContent');
+  el.innerHTML = '<div class="loading"><div class="spinner"></div> Loading…</div>';
+  try {
+    const d = await api('/api/telegram/sender/status');
+    if (d.error) { el.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:8px">No status.json yet — run advanced_sender.py first</div>`; return; }
+
+    document.getElementById('senderStatus').textContent =
+      `(today: ${d.today_total} sent, ${d.replied_total} replied)`;
+
+    const daily = d.daily_counts || {};
+    const maxSent = Math.max(1, ...Object.values(daily));
+    const DAILY_LIMIT = 25;
+
+    const bars = Object.entries(daily).map(([acc, cnt]) => `
+      <div class="sender-acc-row">
+        <span class="acc-name">${esc(acc)}</span>
+        <div class="bar-wrap"><div class="bar-fill" style="width:${Math.round(cnt/DAILY_LIMIT*100)}%"></div></div>
+        <span class="bar-count">${cnt}/${DAILY_LIMIT}</span>
+      </div>`).join('');
+
+    const hotHtml = d.hot_leads && d.hot_leads.length
+      ? `<div class="sender-hot">
+          <h4>🔥 Горячие лиды (${d.hot_leads.length})</h4>
+          ${d.hot_leads.map(h => `<div class="sender-hot-item"><span>${esc(h.phone)}</span><span style="color:var(--muted)">${esc(h.first_name)}</span></div>`).join('')}
+        </div>`
+      : '';
+
+    el.innerHTML = `
+      <div class="sender-grid">
+        <div class="sender-stat"><div class="sv">${d.contacts_total}</div><div class="sk">Контактов</div></div>
+        <div class="sender-stat"><div class="sv">${d.sent_total}</div><div class="sk">Сообщений отправлено</div></div>
+        <div class="sender-stat"><div class="sv" style="color:var(--green)">${d.replied_total}</div><div class="sk">Ответили (горячие)</div></div>
+        <div class="sender-stat"><div class="sv">${d.not_found_total || 0}</div><div class="sk">Не в Telegram</div></div>
+        <div class="sender-stat"><div class="sv">${d.filtered_total}</div><div class="sk">Отфильтровано</div></div>
+        <div class="sender-stat"><div class="sv">${d.today_total}</div><div class="sk">Сегодня отправлено</div></div>
+      </div>
+      ${Object.keys(daily).length ? `<div class="sender-acc-bar">${bars}</div>` : ''}
+      ${hotHtml}`;
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:12px;padding:8px">Sender stats unavailable</div>`;
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
