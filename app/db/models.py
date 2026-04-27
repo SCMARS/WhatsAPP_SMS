@@ -30,10 +30,10 @@ class WhatsAppInstance(Base):
     phone_number: Mapped[str] = mapped_column(String(30), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    daily_limit: Mapped[int] = mapped_column(Integer, default=150, nullable=False)
-    hourly_limit: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
-    min_delay_sec: Mapped[int] = mapped_column(Integer, default=8, nullable=False)
-    max_delay_sec: Mapped[int] = mapped_column(Integer, default=25, nullable=False)
+    daily_limit: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    hourly_limit: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
+    min_delay_sec: Mapped[int] = mapped_column(Integer, default=300, nullable=False)  # 5 minutes
+    max_delay_sec: Mapped[int] = mapped_column(Integer, default=900, nullable=False)  # 15 minutes
     health_status: Mapped[str] = mapped_column(String(50), default="unknown", nullable=False)
     last_health_check: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_send_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -253,6 +253,11 @@ class TelegramMessage(Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Message view tracking
+    viewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    replied_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    check_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="telegram_messages")
     instance: Mapped[Optional["TelegramInstance"]] = relationship("TelegramInstance", back_populates="messages")
